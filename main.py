@@ -4,6 +4,7 @@ import time
 import os
 import datetime
 import telebot
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # --- НАСТРОЙКИ ---
@@ -30,12 +31,13 @@ SUITS = {
 }
 
 history = []
-processed_game_ids = set()  # Игры, добавленные в историю
-checked_game_ids = set()    # Игры, проверенные для прогноза
+processed_game_ids = set()
+checked_game_ids = set()
 completed_count = 0
+game_states = {}  # Отслеживание состояния игр: {gid: (s1, s2, is_finished)}
 
-# Отслеживание количества карт по играм
-game_card_counts = {}
+# Блокировка для потокобезопасности
+state_lock = threading.Lock()
 
 prediction = {
     "active": False,
@@ -46,7 +48,7 @@ prediction = {
     "checked": False
 }
 
-executor = ThreadPoolExecutor(max_workers=6)
+executor = ThreadPoolExecutor(max_workers=4)
 
 def get_utc_game_number():
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -108,8 +110,8 @@ def update_message(suffix=""):
     game_num = prediction["game_num"]
     suit = prediction["suit"]
     
-    msg = f"БАККАРА #N{game_num}\n"
-    msg += f" Масть: {SUITS[suit]['symbol']} {SUITS[suit]['name']}"
+    msg = f"БАККАРА #{game_num}\n"
+    msg += f"🂠 Масть: {SUITS[suit]['symbol']} {SUITS[suit]['name']}"
     if suffix:
         msg += f" {suffix}"
     
@@ -132,52 +134,44 @@ def reset_prediction():
     prediction["message_id"] = None
     prediction["checked"] = False
 
-def add_to_history(game_id, player_suits):
-    """Добавляет карты в историю для прогноза (первые 2 карты)"""
+def handle_game_update(gid, is_finished):
+    """Фоновая обработка игры"""
     global completed_count
     
-    if game_id in processed_game_ids:
+    suits, _ = fetch_game_details(gid)
+    if not suits:
         return
-    
-    processed_game_ids.add(game_id)
-    if player_suits:
-        # Берем только первые 2 карты для прогноза
-        history.extend(player_suits[:2])
-    completed_count += 1
-    
-    print(f"⚡ Добавлено в историю: Игра #{game_id} | Карт: {len(player_suits[:2])} | Масти: {[SUITS[s]['symbol'] for s in player_suits[:2]]} | Счетчик: {completed_count}")
 
-def check_prediction(game_id, player_suits):
-    """Проверяет прогноз по всем картам игры (до 3)"""
-    if game_id in checked_game_ids:
-        return
-    
-    if not prediction["active"] or prediction["checked"] or prediction["base_count"] is None:
-        return
-    
-    offset = completed_count - prediction["base_count"]
-    
-    if 1 <= offset <= 3:
-        # Проверяем по ВСЕМ картам (до 3)
-        all_suits = player_suits[:3] if player_suits else []
-        
-        if prediction["suit"] in all_suits:
-            emoji_map = {1: "✅0️⃣", 2: "✅1️⃣", 3: "✅2️⃣"}
-            update_message(emoji_map[offset])
-            print(f"✅ Успех на позиции {offset-1} (игра #{game_id}, карты: {[SUITS[s]['symbol'] for s in all_suits]})")
-            prediction["checked"] = True
-            checked_game_ids.add(game_id)
-            reset_prediction()
-        elif offset == 3:
-            update_message("❌")
-            print(f"❌ Провал (игра #{game_id}, карты: {[SUITS[s]['symbol'] for s in all_suits]})")
-            prediction["checked"] = True
-            checked_game_ids.add(game_id)
-            reset_prediction()
+    with state_lock:
+        # 1. Добавляем в историю (первые 2 карты)
+        if gid not in processed_game_ids and len(suits) >= 2:
+            processed_game_ids.add(gid)
+            history.extend(suits[:2])
+            completed_count += 1
+            print(f"⚡ История: Игра #{gid} | Карт: {suits[:2]} | Счетчик: {completed_count}")
+
+        # 2. Проверяем прогноз (все карты до 3, либо если игра завершилась с 2 картами)
+        if gid not in checked_game_ids and (len(suits) >= 3 or is_finished):
+            checked_game_ids.add(gid)
+            
+            if prediction["active"] and not prediction["checked"] and prediction["base_count"] is not None:
+                offset = completed_count - prediction["base_count"]
+                
+                if 1 <= offset <= 3:
+                    all_check_suits = suits[:3]
+                    if prediction["suit"] in all_check_suits:
+                        emoji_map = {1: "✅0️⃣", 2: "✅1️", 3: "✅2️"}
+                        update_message(emoji_map[offset])
+                        print(f"✅ Успех на позиции {offset-1} (игра #{gid})")
+                        prediction["checked"] = True
+                        reset_prediction()
+                    elif offset == 3:
+                        update_message("❌")
+                        print(f"❌ Провал (игра #{gid})")
+                        prediction["checked"] = True
+                        reset_prediction()
 
 def create_prediction():
-    global prediction
-    
     next_game_num = get_utc_game_number() + 1
     
     resp = requests.get(LIST_URL, headers=HEADERS, timeout=5, proxies=NO_PROXY)
@@ -194,13 +188,13 @@ def create_prediction():
             break
     
     if not next_game:
-        return False
+        return
     
     next_id = next_game.get("I")
     _, odds = fetch_game_details(next_id)
     
     if not odds:
-        return False
+        return
     
     best_suit = calculate_best_suit(odds)
     
@@ -212,43 +206,40 @@ def create_prediction():
     prediction["checked"] = False
     
     update_message()
-    print(f"🎯 Прогноз на БАККАРА #N{next_game_num}, масть {SUITS[best_suit]['name']}, база: {completed_count}")
-    return True
+    print(f" Прогноз на БАККАРА #{next_game_num}, масть {SUITS[best_suit]['name']}, база: {completed_count}")
 
 def main():
     global completed_count
     
-    print("🚀 Запуск бота БАККАРА (2 карты для прогноза, 3 для проверки)...")
+    print("🚀 Запуск бота БАККАРА (оптимизированный)...")
     
     # Начальный сбор истории
     try:
         resp = requests.get(LIST_URL, headers=HEADERS, timeout=10, proxies=NO_PROXY)
         games = resp.json().get("Value", [])
         
-        futures = []
         for g in games:
             if g.get("SC", {}).get("CPS") == "Игра завершена":
                 gid = g.get("I")
                 if gid not in processed_game_ids:
-                    futures.append((gid, executor.submit(fetch_game_details, gid)))
-        
-        for gid, future in futures:
-            suits, _ = future.result(timeout=10)
-            if suits:
-                add_to_history(gid, suits)
-                checked_game_ids.add(gid)  # Завершенные игры сразу помечаем как проверенные
+                    suits, _ = fetch_game_details(gid)
+                    if suits:
+                        with state_lock:
+                            history.extend(suits[:2])
+                            processed_game_ids.add(gid)
+                            checked_game_ids.add(gid)
+                            completed_count += 1
         
         print(f"📊 Начальная история: {len(history)} карт, {completed_count} игр")
     except Exception as e:
-        print(f"️ Ошибка начального сбора: {e}")
+        print(f"⚠️ Ошибка начального сбора: {e}")
     
     while True:
         try:
             resp = requests.get(LIST_URL, headers=HEADERS, timeout=5, proxies=NO_PROXY)
             games = resp.json().get("Value", [])
             
-            # Обработка игр
-            futures = []
+            # Отслеживаем изменения состояния игр
             for g in games:
                 gid = g.get("I")
                 scores = g.get("SC", {})
@@ -257,27 +248,14 @@ def main():
                 s2 = fs.get("S2", 0)
                 is_finished = scores.get("CPS") == "Игра завершена"
                 
-                # Игра идет или завершена
-                if (is_finished or (s1 > 0 or s2 > 0)):
-                    # Проверяем, изменилось ли количество карт
-                    _, current_suits = fetch_game_details(gid)
-                    if current_suits:
-                        card_count = len(current_suits)
-                        prev_count = game_card_counts.get(gid, 0)
-                        game_card_counts[gid] = card_count
-                        
-                        # Если карт стало больше или игра завершена
-                        if card_count > prev_count or is_finished:
-                            futures.append((gid, current_suits, is_finished))
-            
-            for gid, suits, is_finished in futures:
-                # Добавляем в историю если еще не добавлено (первые 2 карты)
-                if gid not in processed_game_ids and len(suits) >= 2:
-                    add_to_history(gid, suits)
+                last_state = game_states.get(gid, (0, 0, False))
+                last_s1, last_s2, last_finished = last_state
                 
-                # Проверяем прогноз если карт 3 или игра завершена
-                if (len(suits) >= 3 or is_finished) and gid not in checked_game_ids:
-                    check_prediction(gid, suits)
+                # Если счет изменился (игра началась) или статус изменился (завершилась)
+                if (s1 > 0 or s2 > 0 or is_finished) and not (s1 == last_s1 and s2 == last_s2 and is_finished == last_finished):
+                    game_states[gid] = (s1, s2, is_finished)
+                    # Запускаем обработку в фоне, не блокируя цикл
+                    executor.submit(handle_game_update, gid, is_finished)
             
             # Создание прогноза
             if not prediction["active"] or prediction["checked"]:
@@ -286,7 +264,8 @@ def main():
             time.sleep(1)
             
         except Exception as e:
-            time.sleep(1)
+            print(f"Ошибка цикла: {e}")
+            time.sleep(2)
 
 if __name__ == "__main__":
     main()
