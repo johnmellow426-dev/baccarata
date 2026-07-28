@@ -25,7 +25,7 @@ bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
 SUITS = {
     0: {"name": "Пики", "symbol": "♠️"},
-    1: {"name": "Трефы", "symbol": "♣️"},
+    1: {"name": "Трефы", "symbol": "️"},
     2: {"name": "Бубны", "symbol": "♦️"},
     3: {"name": "Червы", "symbol": "♥️"}
 }
@@ -42,20 +42,17 @@ current_prediction = {
     "game_num": None,
     "suit": None,
     "dogen_level": 1,
-    "is_checked": False,
-    "target_game_num": None
+    "is_checked": False
 }
 
 # Статистика
 prediction_stats = {"total": 0, "wins": 0, "losses": 0}
 
 def get_utc_game_number():
-    """Номер игры 1-1440 по UTC+0"""
     now = datetime.datetime.utcnow()
     return (now.hour * 60) + now.minute + 1
 
 def fetch_game_details(game_id):
-    """Получает реальные карты и коэффициенты через GetGameZip"""
     try:
         url = DETAIL_URL_TEMPLATE.format(game_id=game_id)
         resp = requests.get(url, headers=HEADERS, timeout=10, proxies=NO_PROXY)
@@ -96,7 +93,6 @@ def fetch_game_details(game_id):
         return None, None
 
 def fetch_finished_games_results():
-    """Собирает историю завершенных игр"""
     global history
     
     try:
@@ -128,10 +124,9 @@ def fetch_finished_games_results():
             history = history[-(WINDOW_SIZE * 3):]
             
     except Exception as e:
-        print(f"⚠️ Ошибка списка: {e}")
+        print(f"️ Ошибка списка: {e}")
 
 def calculate_anomaly_scores(current_odds):
-    """Расчет аномалии мастей"""
     scores = {}
     suit_counts = {0: 0, 1: 0, 2: 0, 3: 0}
     suit_last_seen = {0: -1, 1: -1, 2: -1, 3: -1}
@@ -168,7 +163,6 @@ def calculate_anomaly_scores(current_odds):
     return scores
 
 def send_prediction_message():
-    """Отправляет или редактирует сообщение прогноза"""
     if not current_prediction.get("game_num") or not current_prediction.get("suit"):
         return
     
@@ -176,11 +170,12 @@ def send_prediction_message():
     suit = current_prediction["suit"]
     dogen = current_prediction["dogen_level"]
     
+    # ИСПРАВЛЕНИЕ: правильное имя переменной
     dogen_emoji = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣"}
     
     msg = f"🎯 **БАККАРА #{game_num}**\n"
     msg += f"🂠 **Масть:** {SUITS[suit]['symbol']} {SUITS[suit]['name']}\n"
-    msg += f"⏳ **Догон:** {dogens_emoji.get(dogen, str(dogen))}"
+    msg += f" **Догон:** {dogens_emoji.get(dogen, str(dogen))}"
     
     try:
         if current_prediction["message_id"] is None:
@@ -198,7 +193,6 @@ def send_prediction_message():
         print(f"❌ Ошибка Telegram: {e}")
 
 def finalize_prediction(result):
-    """Завершает прогноз с результатом"""
     if not current_prediction.get("message_id"):
         return
     
@@ -206,26 +200,23 @@ def finalize_prediction(result):
     suit = current_prediction["suit"]
     dogen = current_prediction["dogen_level"]
     
-    dogen_emoji = {1: "1️", 2: "2️⃣", 3: "3️⃣"}
+    # ИСПРАВЛЕНИЕ: правильное имя переменной и эмодзи
+    dogen_emoji = {1: "1️⃣", 2: "2️", 3: "3️⃣"}
     
     if result:
-        # Успех
         prediction_stats["wins"] += 1
-        msg = f"🎯 **БАККАРА #{game_num}**\n"
+        msg = f" **БАККАРА #{game_num}**\n"
         msg += f"🂠 **Масть:** {SUITS[suit]['symbol']} {SUITS[suit]['name']}\n"
         msg += f"✅{dogens_emoji.get(dogen, str(dogen))}"
         
-        # Сброс догона
         current_prediction["dogen_level"] = 1
         print(f"✅ Прогноз #{game_num} успешный на догоне {dogen}")
     else:
-        # Проигрыш
         prediction_stats["losses"] += 1
         msg = f"🎯 **БАККАРА #{game_num}**\n"
         msg += f"🂠 **Масть:** {SUITS[suit]['symbol']} {SUITS[suit]['name']}\n"
-        msg += f"❌{dogens_emoji.get(dogen, str(dogen))}"
+        msg += f"{dogens_emoji.get(dogen, str(dogen))}"
         
-        # Увеличение догона (макс 3)
         if dogen < 3:
             current_prediction["dogen_level"] = dogen + 1
             print(f"❌ Прогноз #{game_num} проигрыш, следующий догон {dogen + 1}")
@@ -247,14 +238,6 @@ def finalize_prediction(result):
     
     current_prediction["is_checked"] = True
     current_prediction["message_id"] = None
-
-def check_prediction_for_game(game_num, player_suits):
-    """Проверяет, есть ли прогнозируемая масть в игре"""
-    if not current_prediction.get("suit") or current_prediction["is_checked"]:
-        return False
-    
-    predicted_suit = current_prediction["suit"]
-    return predicted_suit in player_suits
 
 def main():
     global current_prediction
@@ -281,7 +264,6 @@ def main():
             
             fetch_finished_games_results()
             
-            # Ищем следующую игру
             next_game = None
             for g in games:
                 if g.get("SC", {}).get("I") == "Ставки до начала игры":
@@ -293,37 +275,27 @@ def main():
                 time.sleep(5)
                 continue
             
-            # Проверяем завершенные игры на предмет текущего прогноза
-            for g in games:
-                scores = g.get("SC", {})
-                if scores.get("CPS") == "Игра завершена":
-                    game_id = g.get("I")
-                    if game_id and game_id not in processed_game_ids:
-                        # Эта игра уже обработана в fetch_finished_games_results
-                        pass
-            
             next_game_id = next_game.get("I")
             
-            # Если есть активный непроверенный прогноз - проверяем его
+            # Если есть активный непроверенный прогноз - проверяем его по первой завершившейся игре
             if current_prediction.get("game_num") and not current_prediction["is_checked"]:
-                # Ищем завершенную игру с нужным номером
                 for g in games:
                     scores = g.get("SC", {})
                     if scores.get("CPS") == "Игра завершена":
                         game_id = g.get("I")
                         if game_id and game_id in processed_game_ids:
-                            # Получаем масти этой игры
                             player_suits, _ = fetch_game_details(game_id)
                             if player_suits:
-                                has_suit = check_prediction_for_game(None, player_suits)
+                                predicted_suit = current_prediction["suit"]
+                                has_suit = predicted_suit in player_suits
                                 finalize_prediction(has_suit)
                                 break
             
-            # Создаем новый прогноз для следующей игры
+            # Создаем новый прогноз
             if next_game_id != last_prediction_game_id and not current_prediction.get("is_checked"):
                 game_num = get_utc_game_number()
                 
-                print(f"\n🎯 Анализ игры #{game_num} (ID: {next_game_id})")
+                print(f"\n Анализ игры #{game_num} (ID: {next_game_id})")
                 
                 _, current_odds = fetch_game_details(next_game_id)
                 
