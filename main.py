@@ -175,7 +175,7 @@ def send_prediction_message():
     
     msg = f"🎯 **БАККАРА #{game_num}**\n"
     msg += f"🂠 **Масть:** {SUITS[suit]['symbol']} {SUITS[suit]['name']}\n"
-    msg += f" **Догон:** {dogens_emoji.get(dogen, str(dogen))}"
+    msg += f" **Догон:** {dogen_emoji.get(dogen, str(dogen))}"
     
     try:
         if current_prediction["message_id"] is None:
@@ -207,7 +207,7 @@ def finalize_prediction(result):
         prediction_stats["wins"] += 1
         msg = f" **БАККАРА #{game_num}**\n"
         msg += f"🂠 **Масть:** {SUITS[suit]['symbol']} {SUITS[suit]['name']}\n"
-        msg += f"✅{dogens_emoji.get(dogen, str(dogen))}"
+        msg += f"✅{dogen_emoji.get(dogen, str(dogen))}"
         
         current_prediction["dogen_level"] = 1
         print(f"✅ Прогноз #{game_num} успешный на догоне {dogen}")
@@ -215,7 +215,7 @@ def finalize_prediction(result):
         prediction_stats["losses"] += 1
         msg = f"🎯 **БАККАРА #{game_num}**\n"
         msg += f"🂠 **Масть:** {SUITS[suit]['symbol']} {SUITS[suit]['name']}\n"
-        msg += f"{dogens_emoji.get(dogen, str(dogen))}"
+        msg += f"{dogen_emoji.get(dogen, str(dogen))}"
         
         if dogen < 3:
             current_prediction["dogen_level"] = dogen + 1
