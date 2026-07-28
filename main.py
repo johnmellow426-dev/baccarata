@@ -3,7 +3,7 @@ import json
 import time
 from collections import defaultdict
 
-# --- НАСТРОЙКИ ДЛЯ БАККАРЫ (используем надежный формат gamesByChamp) ---
+# --- НАСТРОЙКИ ДЛЯ БАККАРЫ ---
 VIRTUAL_URL = "https://melbet-5427.pro/cyber-api/mainfeedlive/web/cyber/v3/gamesByChamp?cfView=3&champId=2050671&country=192&fcountry=192&gr=1521&lng=ru&ref=8"
 STATISTIC_URL_TEMPLATE = "https://melbet-5427.pro/cyber-api/mainfeedlive/web/cyber/v3/statistic?country=192&fcountry=192&gameId={game_id}&gr=1521&lng=ru&ref=8"
 
@@ -17,7 +17,7 @@ NO_PROXY = {"http": None, "https": None}
 
 SUITS = {
     0: {"name": "Пики", "symbol": "♠️"},
-    1: {"name": "Трефы", "symbol": "♣️"},
+    1: {"name": "Трефы", "symbol": "️"},
     2: {"name": "Бубны", "symbol": "♦️"},
     3: {"name": "Червы", "symbol": "♥️"}
 }
@@ -38,17 +38,15 @@ def fetch_finished_games_results():
     try:
         resp = requests.get(VIRTUAL_URL, headers=HEADERS, timeout=10, proxies=NO_PROXY)
         data = resp.json()
-        # Поддержка и gamesByChamp, и VZip
-        games = data.get("games", data.get("Value", []))
+        games = data.get("games", [])
         
         for game in games:
-            game_id = game.get("id", game.get("I"))
-            scores = game.get("scores", game.get("SC", {}))
+            game_id = game.get("id")
+            scores = game.get("scores", {})
             
-            # Универсальная проверка на завершение
             is_finished = (
                 scores.get("currentPeriodName") == "Игра завершена" or 
-                game.get("S") == 3
+                (scores.get("fullScore") != "0-0" and not game.get("nonStarted", False))
             )
             
             if is_finished and game_id and game_id not in processed_game_ids:
@@ -57,6 +55,7 @@ def fetch_finished_games_results():
                 
                 if stat_resp.status_code == 200:
                     stat_data = stat_resp.json()
+                    # В Баккаре Игрок = P1, Банкир = P2
                     p1_cards_str = stat_data.get("statistic", {}).get("main", {}).get("P1", "[]")
                     
                     try:
@@ -78,23 +77,23 @@ def fetch_finished_games_results():
 
 def get_current_odds(game_data):
     current_odds = {0: 1.75, 1: 1.75, 2: 1.75, 3: 1.75}
-    # Поддержка и eventGroups, и O (для VZip)
-    odds_groups = game_data.get("eventGroups", game_data.get("O", []))
     
-    for group in odds_groups:
-        group_id = group.get("groupId", group.get("G"))
-        # 8443 - это масти Игрока в Баккаре/21 очко
-        if group_id == 8443:
-            events = group.get("events", group.get("C", [[]]))
+    event_groups = game_data.get("eventGroups", [])
+    
+    for group in event_groups:
+        # groupId 8443 = масти Игрока в Баккаре
+        if group.get("groupId") == 8443:
+            events = group.get("events", [[]])
             if isinstance(events, list) and len(events) > 0 and isinstance(events[0], list):
                 events = events[0]
                 
             for event in events:
-                player_info = event.get("player", event.get("P", {}))
+                player_info = event.get("player", {})
                 name = player_info.get("name", "")
                 suit_idx = get_suit_from_name(name)
                 if suit_idx != -1:
-                    current_odds[suit_idx] = event.get("cf", event.get("Cf", 1.75))
+                    current_odds[suit_idx] = event.get("cf", 1.75)
+                    
     return current_odds
 
 def calculate_anomaly_scores(current_odds):
@@ -150,37 +149,29 @@ def main():
     while True:
         try:
             print("="*70)
-            print(f"🔄 Сканирование рынка Баккары... (В истории {len(history)} карт Игрока)")
+            print(f"🔄 Сканирование рынка БАККАРЫ... (В истории {len(history)} карт Игрока)")
             
             resp = requests.get(VIRTUAL_URL, headers=HEADERS, timeout=10, proxies=NO_PROXY)
             data = resp.json()
-            games = data.get("games", data.get("Value", []))
+            games = data.get("games", [])
             
-            # УНИВЕРСАЛЬНЫЙ ПОИСК СЛЕДУЮЩЕЙ ИГРЫ
             next_game = None
             for g in games:
-                scores = g.get("scores", g.get("SC", {}))
-                full_score = scores.get("fullScore", scores.get("FS", "0-0"))
-                current_period = scores.get("currentPeriodName", "")
-                info = scores.get("info", "")
-                non_started = g.get("nonStarted", False) or g.get("S") == 1
-                
-                # Если игра не началась, ИЛИ счет 0-0, ИЛИ статус "Ставки до начала игры"
-                if non_started or full_score == "0-0" or current_period == "Ставки до начала игры" or info == "Ставки до начала игры":
+                if g.get("nonStarted", False):
                     next_game = g
                     break
             
             if not next_game:
-                print("⏳ Все игры идут или завершены. Жду обновления списка (Баккара запускается волнами)...")
+                print(" Все игры идут или завершены. Жду обновления списка...")
                 time.sleep(5)
                 continue
                 
             fetch_finished_games_results()
             
-            next_game_id = next_game.get("id", next_game.get("I"))
+            next_game_id = next_game.get("id")
             
             if next_game_id != last_prediction_game_id:
-                print(f"\n🎯 Прогноз для следующей игры Баккары (ID: {next_game_id})")
+                print(f"\n🎯 Прогноз для следующей игры БАККАРЫ (ID: {next_game_id})")
                 
                 current_odds = get_current_odds(next_game)
                 scores = calculate_anomaly_scores(current_odds)
@@ -199,7 +190,7 @@ def main():
                 best_data = sorted_suits[0][1]
                 
                 print("\n" + "="*70)
-                print(f"🔥 ВЕРДИКТ АЛГОРИТМА ДЛЯ БАККАРЫ:")
+                print(f" ВЕРДИКТ АЛГОРИТМА ДЛЯ БАККАРЫ:")
                 print(f"Наибольшая аномалия у масти Игрока: {SUITS[best_suit]['symbol']} {SUITS[best_suit]['name']}")
                 print(f"Причина: Не выпадала {best_data['streak']} раз(а), частота {best_data['freq']}, кф {best_data['current_cf']}")
                 print("="*70 + "\n")
