@@ -110,7 +110,7 @@ def update_message(suffix=""):
     game_num = prediction["game_num"]
     suit = prediction["suit"]
     
-    msg = f"БАККАРА #{game_num}\n"
+    msg = f"БАККАРА #N{game_num}\n"
     msg += f"🂠 Масть: {SUITS[suit]['symbol']} {SUITS[suit]['name']}"
     if suffix:
         msg += f" {suffix}"
@@ -160,7 +160,7 @@ def handle_game_update(gid, is_finished):
                 if 1 <= offset <= 3:
                     all_check_suits = suits[:3]
                     if prediction["suit"] in all_check_suits:
-                        emoji_map = {1: "✅0️⃣", 2: "✅1️", 3: "✅2️"}
+                        emoji_map = {1: "✅0️⃣", 2: "✅1️⃣", 3: "✅2️⃣"}
                         update_message(emoji_map[offset])
                         print(f"✅ Успех на позиции {offset-1} (игра #{gid})")
                         prediction["checked"] = True
@@ -206,7 +206,7 @@ def create_prediction():
     prediction["checked"] = False
     
     update_message()
-    print(f" Прогноз на БАККАРА #{next_game_num}, масть {SUITS[best_suit]['name']}, база: {completed_count}")
+    print(f" Прогноз на БАККАРА #N{next_game_num}, масть {SUITS[best_suit]['name']}, база: {completed_count}")
 
 def main():
     global completed_count
