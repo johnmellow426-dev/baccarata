@@ -30,8 +30,8 @@ SUITS = {
 }
 
 history = []
-processed_game_ids = set()  # Игры, по которым уже сделали прогноз
-completed_count = 0  # Счетчик обработанных игр (для диапазона N, N+1, N+2)
+processed_game_ids = set()
+completed_count = 0
 
 prediction = {
     "active": False,
@@ -105,7 +105,7 @@ def update_message(suffix=""):
     suit = prediction["suit"]
     
     msg = f"БАККАРА #{game_num}\n"
-    msg += f"🂠 Масть: {SUITS[suit]['symbol']} {SUITS[suit]['name']}"
+    msg += f" Масть: {SUITS[suit]['symbol']} {SUITS[suit]['name']}"
     if suffix:
         msg += f" {suffix}"
     
@@ -113,7 +113,7 @@ def update_message(suffix=""):
         if prediction["message_id"] is None:
             sent = bot.send_message(CHANNEL_ID, msg, parse_mode=None)
             prediction["message_id"] = sent.message_id
-            print(f" Отправлено: {msg}")
+            print(f"📤 Отправлено: {msg}")
         else:
             bot.edit_message_text(chat_id=CHANNEL_ID, message_id=prediction["message_id"], text=msg)
             print(f"✏️ Обновлено: {msg}")
@@ -129,66 +129,81 @@ def reset_prediction():
     prediction["checked"] = False
 
 def process_game_with_cards(game_id, player_suits):
-    """Обрабатывает игру, как только появились карты"""
     global completed_count
     
     if game_id in processed_game_ids:
-        return False
+        return
     
     processed_game_ids.add(game_id)
     if player_suits:
         history.extend(player_suits)
     completed_count += 1
     
-    print(f"⚡ Обработана игра #{game_id} | Карт: {len(player_suits)} | Масти: {[SUITS[s]['symbol'] for s in player_suits]} | Счетчик: {completed_count}")
+    print(f"⚡ Игра #{game_id} | Карт: {len(player_suits)} | Масти: {[SUITS[s]['symbol'] for s in player_suits]} | Счетчик: {completed_count}")
     
     # Проверяем текущий прогноз
     if prediction["active"] and not prediction["checked"] and prediction["base_count"] is not None:
-        offset = completed_count - prediction["base_count"] - 1
+        offset = completed_count - prediction["base_count"]
         
-        if 0 <= offset <= 2:
+        if 1 <= offset <= 3:
             if prediction["suit"] in (player_suits or []):
-                emoji_map = {0: "✅0️⃣", 1: "✅1️⃣", 2: "✅2️⃣"}
+                emoji_map = {1: "✅0️⃣", 2: "✅1️⃣", 3: "✅2️⃣"}
                 update_message(emoji_map[offset])
                 prediction["checked"] = True
                 reset_prediction()
-                return True
-            elif offset == 2:
-                update_message("")
+            elif offset == 3:
+                update_message("❌")
                 prediction["checked"] = True
                 reset_prediction()
-                return True
-    
-    return False
 
-def create_prediction(next_game_id):
-    """Создает прогноз на следующую игру"""
+def create_prediction():
     global prediction
     
-    _, odds = fetch_game_details(next_game_id)
+    # Прогноз на СЛЕДУЮЩУЮ игру (текущая + 1)
+    next_game_num = get_utc_game_number() + 1
+    
+    # Берём коэффициенты из любой будущей игры
+    resp = requests.get(LIST_URL, headers=HEADERS, timeout=5, proxies=NO_PROXY)
+    games = resp.json().get("Value", [])
+    
+    next_game = None
+    for g in games:
+        scores = g.get("SC", {})
+        fs = scores.get("FS", {})
+        s1 = fs.get("S1", 0)
+        s2 = fs.get("S2", 0)
+        if s1 == 0 and s2 == 0 and scores.get("CPS") != "Игра завершена":
+            next_game = g
+            break
+    
+    if not next_game:
+        return False
+    
+    next_id = next_game.get("I")
+    _, odds = fetch_game_details(next_id)
+    
     if not odds:
         return False
     
     best_suit = calculate_best_suit(odds)
-    game_num = get_utc_game_number()
     
     prediction["active"] = True
-    prediction["game_num"] = game_num
+    prediction["game_num"] = next_game_num
     prediction["base_count"] = completed_count
     prediction["suit"] = best_suit
     prediction["message_id"] = None
     prediction["checked"] = False
     
     update_message()
-    print(f"🎯 Прогноз: БАККАРА #{game_num}, масть {SUITS[best_suit]['name']}, база: {completed_count}")
+    print(f"🎯 Прогноз на БАККАРА #N{next_game_num}, масть {SUITS[best_suit]['name']}, база: {completed_count}")
     return True
 
 def main():
     global completed_count
     
-    print("🚀 Запуск бота БАККАРА (мгновенный прогноз по 2 картам)...")
+    print("🚀 Запуск бота БАККАРА (прогноз на N+1)...")
     
-    # Начальный сбор истории по завершенным играм
+    # Начальный сбор истории
     try:
         resp = requests.get(LIST_URL, headers=HEADERS, timeout=10, proxies=NO_PROXY)
         games = resp.json().get("Value", [])
@@ -216,7 +231,7 @@ def main():
             resp = requests.get(LIST_URL, headers=HEADERS, timeout=5, proxies=NO_PROXY)
             games = resp.json().get("Value", [])
             
-            # 1. Ищем игры с картами (счет != 0-0 и не завершена)
+            # Обработка игр с картами
             futures = []
             for g in games:
                 gid = g.get("I")
@@ -226,37 +241,20 @@ def main():
                 s2 = fs.get("S2", 0)
                 is_finished = scores.get("CPS") == "Игра завершена"
                 
-                # Игра идет (есть счет) или завершена, и еще не обработана
                 if gid not in processed_game_ids and (is_finished or (s1 > 0 or s2 > 0)):
                     futures.append((gid, executor.submit(fetch_game_details, gid)))
             
-            # Обрабатываем результаты
-            new_cards_found = False
             for gid, future in futures:
                 try:
                     suits, _ = future.result(timeout=5)
-                    if suits and len(suits) >= 2:  # Минимум 2 карты у Игрока
-                        if process_game_with_cards(gid, suits):
-                            new_cards_found = True
+                    if suits and len(suits) >= 2:
+                        process_game_with_cards(gid, suits)
                 except:
                     pass
             
-            # 2. Если прогноз проверен или не активен - создаем новый на следующую игру
+            # Создание прогноза на следующую игру
             if not prediction["active"] or prediction["checked"]:
-                next_game = None
-                for g in games:
-                    scores = g.get("SC", {})
-                    fs = scores.get("FS", {})
-                    s1 = fs.get("S1", 0)
-                    s2 = fs.get("S2", 0)
-                    # Ищем игру без счета (еще не началась)
-                    if s1 == 0 and s2 == 0 and scores.get("CPS") != "Игра завершена":
-                        next_game = g
-                        break
-                
-                if next_game:
-                    next_id = next_game.get("I")
-                    create_prediction(next_id)
+                create_prediction()
             
             time.sleep(1)
             
