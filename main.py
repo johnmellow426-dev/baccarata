@@ -3,11 +3,8 @@ import json
 import time
 from collections import defaultdict
 
-# --- НАСТРОЙКИ ДЛЯ БАККАРЫ ---
-# 1. Список игр (для поиска ID и статусов)
-LIST_URL = "https://melbet-5427.pro/cyber-api/mainfeedlive/web/cyber/v3/gamesByChamp?cfView=3&champId=2050671&country=192&fcountry=192&gr=1521&lng=ru&ref=8"
-
-# 2. Детали игры (реальные карты + коэффициенты)
+# --- НАСТРОЙКИ ---
+LIST_URL = "https://melbet-5427.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 DETAIL_URL_TEMPLATE = "https://melbet-5427.pro/service-api/LiveFeed/GetGameZip?id={game_id}&isSubGames=true&GroupEvents=true&countevents=250&grMode=4&partner=8&topGroups=&country=192&marketType=1&isNewBuilder=true"
 
 HEADERS = {
@@ -25,14 +22,12 @@ SUITS = {
     3: {"name": "Червы", "symbol": "♥️"}
 }
 
-# Состояние
 history = []
 historical_odds = {0: [], 1: [], 2: [], 3: []}
 processed_game_ids = set()
 WINDOW_SIZE = 30
 
 def fetch_game_details(game_id):
-    """Получает реальные карты и коэффициенты через GetGameZip"""
     try:
         url = DETAIL_URL_TEMPLATE.format(game_id=game_id)
         resp = requests.get(url, headers=HEADERS, timeout=10, proxies=NO_PROXY)
@@ -42,19 +37,16 @@ def fetch_game_details(game_id):
         data = resp.json()
         value = data.get("Value", {})
         
-        # 1. Парсим реальные карты Игрока (Key == "P")
         player_suits = []
         sc_s = value.get("SC", {}).get("S", [])
         for item in sc_s:
             if item.get("Key") == "P":
                 try:
                     cards = json.loads(item.get("Value", "[]"))
-                    # S - это индекс масти (0-3), R - ранг
                     player_suits = [c.get("S") for c in cards if c.get("S") in SUITS]
                 except json.JSONDecodeError:
                     pass
         
-        # 2. Парсим коэффициенты на масти Игрока (G == 10185 для Баккары)
         current_odds = {0: 1.90, 1: 1.90, 2: 1.90, 3: 1.90}
         ge = value.get("GE", [])
         for group in ge:
@@ -72,36 +64,40 @@ def fetch_game_details(game_id):
         return player_suits, current_odds
         
     except Exception as e:
-        print(f"⚠️ Ошибка получения деталей игры #{game_id}: {e}")
+        print(f"⚠️ Ошибка деталей #{game_id}: {e}")
         return None, None
 
 def fetch_finished_games_results():
-    """Находит завершенные игры и забирает их карты в историю"""
+    global history
+    
     try:
         resp = requests.get(LIST_URL, headers=HEADERS, timeout=10, proxies=NO_PROXY)
         data = resp.json()
-        games = data.get("games", [])
+        games = data.get("Value", [])
         
         for game in games:
-            game_id = game.get("id")
-            scores = game.get("scores", {})
+            game_id = game.get("I")
+            scores = game.get("SC", {})
             
-            # Проверка на завершение
-            is_finished = (
-                scores.get("currentPeriodName") == "Игра завершена" or 
-                (scores.get("fullScore") != "0-0" and not game.get("nonStarted", False))
-            )
+            is_finished = scores.get("CPS") == "Игра завершена"
             
             if is_finished and game_id and game_id not in processed_game_ids:
-                print(f" Загружаем детали завершенной игры #{game_id}...")
+                # Получаем счет игры
+                final_score = scores.get("FS", {})
+                s1 = final_score.get("S1", 0)
+                s2 = final_score.get("S2", 0)
+                
+                print(f"📥 Загружаем завершенную игру #{game_id} | Счет: {s1}-{s2}...")
+                
                 player_suits, _ = fetch_game_details(game_id)
                 
                 if player_suits:
                     history.extend(player_suits)
                     processed_game_ids.add(game_id)
                     print(f"✅ Добавлены масти Игрока: {[SUITS[s]['symbol'] for s in player_suits]}")
+                else:
+                    print(f"⚠️ Не удалось получить масти для игры #{game_id}")
                     
-        # Ограничиваем историю
         if len(history) > WINDOW_SIZE * 3:
             history = history[-(WINDOW_SIZE * 3):]
             
@@ -109,7 +105,6 @@ def fetch_finished_games_results():
         print(f"⚠️ Ошибка списка игр: {e}")
 
 def calculate_anomaly_scores(current_odds):
-    """Расчет аномалии на основе истории и текущих кф"""
     scores = {}
     suit_counts = {0: 0, 1: 0, 2: 0, 3: 0}
     suit_last_seen = {0: -1, 1: -1, 2: -1, 3: -1}
@@ -120,16 +115,13 @@ def calculate_anomaly_scores(current_odds):
         suit_last_seen[suit] = idx
     
     for suit in SUITS:
-        # Фактор 1: Задержка (Streak)
         last_seen = suit_last_seen[suit]
         streak = total_cards if last_seen == -1 else (total_cards - 1) - last_seen
         streak_score = min(streak / 5.0, 2.0)
 
-        # Фактор 2: Отклонение частоты (Frequency)
         actual_freq = suit_counts[suit] / total_cards if total_cards > 0 else 0.25
         freq_score = (0.25 - actual_freq) * 8.0
 
-        # Фактор 3: Аномалия коэффициентов (Odds Drop)
         historical_odds[suit].append(current_odds[suit])
         if len(historical_odds[suit]) > WINDOW_SIZE:
             historical_odds[suit].pop(0)
@@ -149,10 +141,9 @@ def calculate_anomaly_scores(current_odds):
     return scores
 
 def main():
-    print("🚀 Запуск анализатора БАККАРЫ (Архитектура GetGameZip)...")
+    print("🚀 Запуск анализатора БАККАРЫ (Счет + Масти)...")
     print("Накапливаю историю завершенных игр...\n")
     
-    # Начальный сбор истории
     for _ in range(3):
         fetch_finished_games_results()
         time.sleep(2)
@@ -169,15 +160,13 @@ def main():
             
             resp = requests.get(LIST_URL, headers=HEADERS, timeout=10, proxies=NO_PROXY)
             data = resp.json()
-            games = data.get("games", [])
+            games = data.get("Value", [])
             
-            # 1. Сначала обновляем историю (вдруг какие-то игры завершились)
             fetch_finished_games_results()
             
-            # 2. Ищем следующую игру
             next_game = None
             for g in games:
-                if g.get("nonStarted", False) or g.get("scores", {}).get("fullScore") == "0-0":
+                if g.get("SC", {}).get("I") == "Ставки до начала игры":
                     next_game = g
                     break
             
@@ -186,13 +175,11 @@ def main():
                 time.sleep(5)
                 continue
                 
-            next_game_id = next_game.get("id")
+            next_game_id = next_game.get("I")
             
-            # 3. Делаем прогноз только для новой игры
             if next_game_id != last_prediction_id:
                 print(f"\n🎯 Анализ следующей игры Баккары (ID: {next_game_id})")
                 
-                # Запрашиваем GetGameZip для получения АКТУАЛЬНЫХ коэффициентов
                 _, current_odds = fetch_game_details(next_game_id)
                 
                 if current_odds:
@@ -226,7 +213,7 @@ def main():
             print("\n🛑 Остановка.")
             break
         except Exception as e:
-            print(f"❌ Критическая ошибка: {e}")
+            print(f" Критическая ошибка: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
