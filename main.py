@@ -3,11 +3,8 @@ import json
 import time
 from collections import defaultdict
 
-# --- НАСТРОЙКИ ДЛЯ БАККАРЫ ---
-# Твой новый URL для Баккары (sport=236, champ=2050671)
-VIRTUAL_URL = "https://melbet-5427.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
-
-# URL для получения реальных карт завершенной игры (остается прежним)
+# --- НАСТРОЙКИ ДЛЯ БАККАРЫ (используем надежный формат gamesByChamp) ---
+VIRTUAL_URL = "https://melbet-5427.pro/cyber-api/mainfeedlive/web/cyber/v3/gamesByChamp?cfView=3&champId=2050671&country=192&fcountry=192&gr=1521&lng=ru&ref=8"
 STATISTIC_URL_TEMPLATE = "https://melbet-5427.pro/cyber-api/mainfeedlive/web/cyber/v3/statistic?country=192&fcountry=192&gameId={game_id}&gr=1521&lng=ru&ref=8"
 
 HEADERS = {
@@ -16,7 +13,6 @@ HEADERS = {
     "Referer": "https://melbet-5427.pro/",
 }
 
-# Отключаем прокси для обхода блокировок
 NO_PROXY = {"http": None, "https": None}
 
 SUITS = {
@@ -39,21 +35,21 @@ def get_suit_from_name(name):
     return -1
 
 def fetch_finished_games_results():
-    """Собирает реальные результаты завершенных игр Баккары"""
     try:
         resp = requests.get(VIRTUAL_URL, headers=HEADERS, timeout=10, proxies=NO_PROXY)
         data = resp.json()
-        
-        # Get1x2_VZip возвращает данные в ключе "Value", gamesByChamp в "games"
-        games = data.get("Value", data.get("games", []))
+        # Поддержка и gamesByChamp, и VZip
+        games = data.get("games", data.get("Value", []))
         
         for game in games:
-            # Поддержка разных форматов ID
-            game_id = game.get("I", game.get("id"))
-            scores = game.get("SC", game.get("scores", {}))
+            game_id = game.get("id", game.get("I"))
+            scores = game.get("scores", game.get("SC", {}))
             
-            # Проверка на завершение: S=3 (стандарт VZip) или явный статус
-            is_finished = scores.get("S") == 3 or scores.get("currentPeriodName") == "Игра завершена"
+            # Универсальная проверка на завершение
+            is_finished = (
+                scores.get("currentPeriodName") == "Игра завершена" or 
+                game.get("S") == 3
+            )
             
             if is_finished and game_id and game_id not in processed_game_ids:
                 stat_url = STATISTIC_URL_TEMPLATE.format(game_id=game_id)
@@ -61,7 +57,6 @@ def fetch_finished_games_results():
                 
                 if stat_resp.status_code == 200:
                     stat_data = stat_resp.json()
-                    # В Баккаре Игрок это P1
                     p1_cards_str = stat_data.get("statistic", {}).get("main", {}).get("P1", "[]")
                     
                     try:
@@ -82,33 +77,27 @@ def fetch_finished_games_results():
         print(f"⚠️ Ошибка сбора истории: {e}")
 
 def get_current_odds(game_data):
-    """Извлекает текущие коэффициенты на масти Игрока из данных игры"""
     current_odds = {0: 1.75, 1: 1.75, 2: 1.75, 3: 1.75}
-    
-    # Формат Get1x2_VZip: ключ "O" (Odds)
-    odds_groups = game_data.get("O", game_data.get("eventGroups", []))
+    # Поддержка и eventGroups, и O (для VZip)
+    odds_groups = game_data.get("eventGroups", game_data.get("O", []))
     
     for group in odds_groups:
-        # Ищем группу по ID или по наличию нужных названий
-        group_id = group.get("G", group.get("groupId"))
-        events = group.get("C", group.get("events", [[]]))
-        
-        # В VZip события часто лежат напрямую в C, а не в массиве массивов
-        if isinstance(events, list) and len(events) > 0 and isinstance(events[0], list):
-            events = events[0]
-            
-        for event in events:
-            player_info = event.get("player", event.get("P", {}))
-            name = player_info.get("name", "")
-            
-            suit_idx = get_suit_from_name(name)
-            if suit_idx != -1:
-                current_odds[suit_idx] = event.get("cf", event.get("Cf", 1.75))
+        group_id = group.get("groupId", group.get("G"))
+        # 8443 - это масти Игрока в Баккаре/21 очко
+        if group_id == 8443:
+            events = group.get("events", group.get("C", [[]]))
+            if isinstance(events, list) and len(events) > 0 and isinstance(events[0], list):
+                events = events[0]
                 
+            for event in events:
+                player_info = event.get("player", event.get("P", {}))
+                name = player_info.get("name", "")
+                suit_idx = get_suit_from_name(name)
+                if suit_idx != -1:
+                    current_odds[suit_idx] = event.get("cf", event.get("Cf", 1.75))
     return current_odds
 
 def calculate_anomaly_scores(current_odds):
-    """Расчет аномалии для каждой масти Игрока"""
     scores = {}
     suit_counts = {0: 0, 1: 0, 2: 0, 3: 0}
     suit_last_seen = {0: -1, 1: -1, 2: -1, 3: -1}
@@ -165,26 +154,30 @@ def main():
             
             resp = requests.get(VIRTUAL_URL, headers=HEADERS, timeout=10, proxies=NO_PROXY)
             data = resp.json()
-            games = data.get("Value", data.get("games", []))
+            games = data.get("games", data.get("Value", []))
             
-            # Ищем следующую игру (не начавшуюся или с нулевым счетом)
+            # УНИВЕРСАЛЬНЫЙ ПОИСК СЛЕДУЮЩЕЙ ИГРЫ
             next_game = None
             for g in games:
-                scores = g.get("SC", g.get("scores", {}))
-                is_not_started = g.get("S") == 1 or scores.get("currentPeriodName") == "Ставки до начала игры" or scores.get("fullScore") == "0-0"
-                if is_not_started:
+                scores = g.get("scores", g.get("SC", {}))
+                full_score = scores.get("fullScore", scores.get("FS", "0-0"))
+                current_period = scores.get("currentPeriodName", "")
+                info = scores.get("info", "")
+                non_started = g.get("nonStarted", False) or g.get("S") == 1
+                
+                # Если игра не началась, ИЛИ счет 0-0, ИЛИ статус "Ставки до начала игры"
+                if non_started or full_score == "0-0" or current_period == "Ставки до начала игры" or info == "Ставки до начала игры":
                     next_game = g
                     break
             
             if not next_game:
-                print("⏳ Все игры идут или завершены. Жду обновления списка...")
+                print("⏳ Все игры идут или завершены. Жду обновления списка (Баккара запускается волнами)...")
                 time.sleep(5)
                 continue
                 
-            # Обновляем историю перед прогнозом
             fetch_finished_games_results()
             
-            next_game_id = next_game.get("I", next_game.get("id"))
+            next_game_id = next_game.get("id", next_game.get("I"))
             
             if next_game_id != last_prediction_game_id:
                 print(f"\n🎯 Прогноз для следующей игры Баккары (ID: {next_game_id})")
