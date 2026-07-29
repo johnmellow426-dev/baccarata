@@ -13,6 +13,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 PREDICTION_CHANNEL_ID = os.getenv("PREDICTION_CHANNEL_ID", CHANNEL_ID)
 
+# ПРОВЕРЯЕМ, ЧТО ТОКЕН ЗАГРУЗИЛСЯ
+print(f"🔑 BOT_TOKEN: {'✅' if BOT_TOKEN else '❌ НЕ НАЙДЕН'}")
+print(f"📢 CHANNEL_ID: {'✅' if CHANNEL_ID else '❌ НЕ НАЙДЕН'}")
+
 LIST_URL = "https://melbet-5427.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 DETAIL_URL_TEMPLATE = "https://melbet-5427.pro/service-api/LiveFeed/GetGameZip?id={game_id}&isSubGames=true&GroupEvents=true&countevents=250&grMode=4&partner=8&topGroups=&country=192&marketType=1&isNewBuilder=true"
 
@@ -23,6 +27,33 @@ HEADERS = {
 }
 NO_PROXY = {"http": None, "https": None}
 
+# --- ТЕСТОВЫЙ ЗАПРОС ПРИ СТАРТЕ ---
+print("\n🔍 ТЕСТИРУЕМ API...")
+
+try:
+    test_resp = requests.get(LIST_URL, headers=HEADERS, timeout=10, proxies=NO_PROXY)
+    print(f"📡 API ответ: {test_resp.status_code}")
+    
+    if test_resp.status_code == 200:
+        test_data = test_resp.json()
+        games_list = test_data.get("Value", [])
+        print(f"📊 Найдено игр: {len(games_list)}")
+        
+        # Показываем первые 3 игры для диагностики
+        for i, g in enumerate(games_list[:3]):
+            print(f"\n🎮 Игра {i+1}:")
+            print(f"  ID: {g.get('I')}")
+            print(f"  Статус: {g.get('SC', {}).get('CPS', 'Неизвестно')}")
+            print(f"  Счет: {g.get('SC', {}).get('FS', {}).get('S1', 0)} - {g.get('SC', {}).get('FS', {}).get('S2', 0)}")
+    else:
+        print(f"❌ Ошибка API: {test_resp.status_code}")
+        print(f"Ответ: {test_resp.text[:200]}")
+except Exception as e:
+    print(f"❌ Ошибка тестового запроса: {e}")
+
+print("\n" + "=" * 60)
+
+# --- БОТ ---
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
 # --- КОНСТАНТЫ ---
@@ -41,29 +72,30 @@ SUITS = {
 
 # СТРАТЕГИЯ ПРОГНОЗИРОВАНИЯ
 PREDICTION_STRATEGY = {
-    1: [(2, 60), (1, 40)],    # A -> 2 или A
-    2: [(3, 55), (2, 45)],    # 2 -> 3 или 2
-    3: [(4, 50), (8, 50)],    # 3 -> 4 или 8
-    4: [(5, 55), (9, 45)],    # 4 -> 5 или 9
-    5: [(6, 50), (10, 50)],   # 5 -> 6 или 10
-    6: [(13, 85), (6, 15)],   # 6 -> K
-    7: [(12, 80), (7, 20)],   # 7 -> Q
-    8: [(11, 80), (8, 20)],   # 8 -> J
-    9: [(12, 65), (9, 35)],   # 9 -> Q
-    10: [(12, 60), (10, 40)],  # 10 -> Q
-    11: [(1, 70), (11, 30)],   # J -> A
-    12: [(1, 70), (12, 30)],   # Q -> A
-    13: [(1, 75), (13, 25)],   # K -> A
-    14: [(2, 60), (1, 40)],    # A -> 2 или A
+    1: [(2, 60), (1, 40)],
+    2: [(3, 55), (2, 45)],
+    3: [(4, 50), (8, 50)],
+    4: [(5, 55), (9, 45)],
+    5: [(6, 50), (10, 50)],
+    6: [(13, 85), (6, 15)],
+    7: [(12, 80), (7, 20)],
+    8: [(11, 80), (8, 20)],
+    9: [(12, 65), (9, 35)],
+    10: [(12, 60), (10, 40)],
+    11: [(1, 70), (11, 30)],
+    12: [(1, 70), (12, 30)],
+    13: [(1, 75), (13, 25)],
+    14: [(2, 60), (1, 40)],
 }
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
-stats = defaultdict(lambda: defaultdict(int))  # Статистика для обучения
-history = []  # История первых карт
-game_details_cache = {}  # Кэш деталей игр
+stats = defaultdict(lambda: defaultdict(int))
+history = []
+game_details_cache = {}
 processed_game_ids = set()
 checked_game_ids = set()
 game_counter = 0
+last_game_num = 0
 
 # Состояние прогноза
 prediction = {
@@ -84,7 +116,7 @@ state_lock = threading.Lock()
 executor = ThreadPoolExecutor(max_workers=4)
 
 # ============================================================
-#   ФУНКЦИИ ДЛЯ РАБОТЫ С КАРТАМИ
+#   ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
 
 def get_utc_game_number():
@@ -102,17 +134,16 @@ def format_card(card_value):
     return CARD_SYMBOLS.get(card_value, str(card_value))
 
 def format_card_full(card_value, suit_code):
-    """Форматирует карту с мастью"""
     symbol = CARD_SYMBOLS.get(card_value, str(card_value))
     suit = SUITS.get(suit_code, {}).get("symbol", "?")
     return f"{symbol}{suit}"
 
 def parse_cards_from_api(cards_json):
-    """
-    Парсит карты из JSON-строки
-    Возвращает список словарей с полной информацией
-    """
+    """Парсит карты из JSON-строки"""
     try:
+        if not cards_json or cards_json == "[]":
+            return []
+        
         cards = json.loads(cards_json)
         parsed = []
         for c in cards:
@@ -127,21 +158,19 @@ def parse_cards_from_api(cards_json):
                 })
         return parsed
     except Exception as e:
+        print(f"⚠️ Ошибка парсинга карт: {e} | JSON: {cards_json[:100]}")
         return []
 
 def get_all_game_cards(game_data):
-    """
-    Получает все карты из игры (игрок и дилер)
-    """
-    result = {
-        "player": [],
-        "dealer": [],
-        "all": []
-    }
+    """Получает все карты из игры"""
+    result = {"player": [], "dealer": [], "all": []}
     
     try:
         sc = game_data.get("SC", {})
         s_list = sc.get("S", [])
+        
+        # Логируем структуру для диагностики
+        print(f"  📋 S_list: {s_list}")
         
         for item in s_list:
             key = item.get("Key", "")
@@ -151,35 +180,16 @@ def get_all_game_cards(game_data):
             if key == "P":
                 result["player"] = cards
                 result["all"].extend(cards)
+                print(f"  🃏 Карты игрока: {[c['full'] for c in cards]}")
             elif key == "D":
                 result["dealer"] = cards
                 result["all"].extend(cards)
+                print(f"  🃏 Карты дилера: {[c['full'] for c in cards]}")
         
         return result
     except Exception as e:
+        print(f"⚠️ Ошибка получения карт: {e}")
         return result
-
-def get_prediction_with_stats(trigger_card):
-    """
-    Возвращает прогноз на основе статистики и стратегии
-    """
-    # Проверяем статистику
-    if trigger_card in stats and sum(stats[trigger_card].values()) > 10:
-        predictions = stats[trigger_card]
-        best_pred = max(predictions, key=predictions.get)
-        return best_pred
-    
-    # Используем стратегию
-    if trigger_card in PREDICTION_STRATEGY:
-        options = PREDICTION_STRATEGY[trigger_card]
-        return max(options, key=lambda x: x[1])[0]
-    
-    return 1  # Дефолтный прогноз
-
-def update_statistics(trigger_card, actual_card):
-    """Обновляет статистику"""
-    with state_lock:
-        stats[trigger_card][actual_card] += 1
 
 # ============================================================
 #   ФУНКЦИИ ДЛЯ РАБОТЫ С API
@@ -188,25 +198,29 @@ def update_statistics(trigger_card, actual_card):
 def fetch_game_details(game_id):
     """Получает детали игры с кэшированием"""
     if game_id in game_details_cache:
+        print(f"  📦 Из кэша: {game_id}")
         return game_details_cache[game_id]
     
     try:
         url = DETAIL_URL_TEMPLATE.format(game_id=game_id)
+        print(f"  📡 Запрос деталей игры {game_id}")
         resp = requests.get(url, headers=HEADERS, timeout=5, proxies=NO_PROXY)
+        
         if resp.status_code != 200:
+            print(f"  ❌ Ошибка: статус {resp.status_code}")
             return None
         
         data = resp.json().get("Value", {})
         game_details_cache[game_id] = data
         
-        # Ограничиваем кэш
         if len(game_details_cache) > 100:
             oldest = list(game_details_cache.keys())[0]
             del game_details_cache[oldest]
         
+        print(f"  ✅ Детали получены")
         return data
     except Exception as e:
-        print(f"⚠️ Ошибка получения деталей игры {game_id}: {e}")
+        print(f"  ❌ Ошибка получения деталей: {e}")
         return None
 
 def get_active_games():
@@ -214,18 +228,17 @@ def get_active_games():
     try:
         resp = requests.get(LIST_URL, headers=HEADERS, timeout=5, proxies=NO_PROXY)
         if resp.status_code != 200:
+            print(f"⚠️ Ошибка получения списка: статус {resp.status_code}")
             return []
         games = resp.json().get("Value", [])
+        print(f"📡 Получено {len(games)} игр")
         return games
     except Exception as e:
         print(f"⚠️ Ошибка получения списка игр: {e}")
         return []
 
 def get_game_card_info(game_id):
-    """
-    Получает полную информацию о картах в игре
-    Возвращает: (cards_info, is_finished)
-    """
+    """Получает полную информацию о картах в игре"""
     game_data = fetch_game_details(game_id)
     if not game_data:
         return None, False
@@ -239,6 +252,24 @@ def get_game_card_info(game_id):
 #   ЛОГИКА ПРОГНОЗИРОВАНИЯ
 # ============================================================
 
+def get_prediction_with_stats(trigger_card):
+    """Возвращает прогноз на основе статистики и стратегии"""
+    if trigger_card in stats and sum(stats[trigger_card].values()) > 10:
+        predictions = stats[trigger_card]
+        best_pred = max(predictions, key=predictions.get)
+        return best_pred
+    
+    if trigger_card in PREDICTION_STRATEGY:
+        options = PREDICTION_STRATEGY[trigger_card]
+        return max(options, key=lambda x: x[1])[0]
+    
+    return 1
+
+def update_statistics(trigger_card, actual_card):
+    """Обновляет статистику"""
+    with state_lock:
+        stats[trigger_card][actual_card] += 1
+
 def check_prediction_for_game(cards_info, predicted_value):
     """Проверяет, есть ли прогнозируемая карта в игре"""
     if not predicted_value:
@@ -246,7 +277,6 @@ def check_prediction_for_game(cards_info, predicted_value):
     
     for card in cards_info.get("all", []):
         val = card["value"]
-        # Для A проверяем 1 и 14
         if predicted_value == 1 and val in [1, 14]:
             return True, val, card["suit"]
         if val == predicted_value:
@@ -255,18 +285,18 @@ def check_prediction_for_game(cards_info, predicted_value):
     return False, None, None
 
 def process_completed_game(game_num, first_card, first_suit, cards_info):
-    """
-    Обрабатывает завершенную игру
-    """
+    """Обрабатывает завершенную игру"""
     global game_counter
     
     with state_lock:
         game_counter += 1
         
-        # 1. Проверяем активный прогноз
+        print(f"  🔄 Обработка игры #{game_num}, прогноз активен: {prediction['active']}")
+        
         if prediction["active"] and not prediction["checked"]:
             target_num = prediction["target_game_num"]
             offset = game_num - target_num
+            print(f"  🎯 Проверка прогноза: target={target_num}, offset={offset}")
             
             if 0 <= offset <= 2:
                 is_hit, hit_value, hit_suit = check_prediction_for_game(
@@ -278,14 +308,12 @@ def process_completed_game(game_num, first_card, first_suit, cards_info):
                     emoji_map = {0: "✅0️⃣", 1: "✅1️⃣", 2: "✅2️⃣"}
                     result_text = f"{emoji_map[offset]} (на {offset+1}-й игре)"
                     
-                    # Добавляем информацию о найденной карте
                     if hit_value:
                         result_text += f"\n🃏 Найдена: {format_card_full(hit_value, hit_suit)}"
                     
                     update_prediction_message(result_text)
-                    print(f"🎯 ПРОГНОЗ СБЫЛСЯ! Игра #{game_num}, попытка {offset+1}")
+                    print(f"  🎯 ПРОГНОЗ СБЫЛСЯ! Попытка {offset+1}")
                     
-                    # Обновляем статистику
                     update_statistics(prediction["trigger_card"], prediction["predicted_value"])
                     
                     prediction["checked"] = True
@@ -293,15 +321,12 @@ def process_completed_game(game_num, first_card, first_suit, cards_info):
                     reset_prediction()
                     
                 elif offset == 2:
-                    # Третья попытка не сработала
-                    # Показываем, какие карты реально выпали
                     actual_cards = ", ".join([c["full"] for c in cards_info.get("all", [])[:3]])
                     result_text = f"❌ НЕ СБЫЛСЯ (3 попытки)\n🃏 Выпали: {actual_cards}"
                     
                     update_prediction_message(result_text)
-                    print(f"❌ ПРОГНОЗ НЕ СБЫЛСЯ! Игра #{game_num}")
+                    print(f"  ❌ ПРОГНОЗ НЕ СБЫЛСЯ")
                     
-                    # Обновляем статистику (триггер -> что-то другое)
                     for card in cards_info.get("all", []):
                         if card["value"] != prediction["predicted_value"]:
                             update_statistics(prediction["trigger_card"], card["value"])
@@ -311,7 +336,6 @@ def process_completed_game(game_num, first_card, first_suit, cards_info):
                     prediction["dogen_level"] = min(prediction["dogen_level"] + 1, 3)
                     reset_prediction()
         
-        # 2. Создаем новый прогноз, если нет активного
         if not prediction["active"] and first_card:
             create_new_prediction(game_num, first_card, first_suit)
 
@@ -320,7 +344,6 @@ def create_new_prediction(trigger_num, trigger_card, trigger_suit):
     if prediction["active"]:
         return
     
-    # Получаем прогнозируемое значение
     pred_value = get_prediction_with_stats(trigger_card)
     pred_symbol = format_card(pred_value)
     
@@ -338,12 +361,11 @@ def create_new_prediction(trigger_num, trigger_card, trigger_suit):
     
     send_prediction_message(trigger_num, trigger_card, trigger_suit, pred_symbol, target_num)
     
-    print(f"🎯 НОВЫЙ ПРОГНОЗ: Триггер #{trigger_num} ({format_card_full(trigger_card, trigger_suit)}) -> Игра #{target_num} ({pred_symbol})")
+    print(f"  🎯 НОВЫЙ ПРОГНОЗ: #{trigger_num} ({format_card_full(trigger_card, trigger_suit)}) -> #{target_num} ({pred_symbol})")
 
 def send_prediction_message(trigger_num, trigger_card, trigger_suit, pred_symbol, target_num):
     """Отправляет прогноз в канал"""
     dogen = prediction["dogen_level"]
-    
     trigger_full = format_card_full(trigger_card, trigger_suit)
     
     msg = (
@@ -362,9 +384,9 @@ def send_prediction_message(trigger_num, trigger_card, trigger_suit, pred_symbol
     try:
         sent = bot.send_message(PREDICTION_CHANNEL_ID, msg)
         prediction["message_id"] = sent.message_id
-        print(f"📤 Прогноз отправлен в канал")
+        print(f"  📤 Прогноз отправлен в канал")
     except Exception as e:
-        print(f"❌ Ошибка отправки прогноза: {e}")
+        print(f"  ❌ Ошибка отправки прогноза: {e}")
 
 def update_prediction_message(result_text):
     """Обновляет сообщение с прогнозом"""
@@ -399,9 +421,9 @@ def update_prediction_message(result_text):
             message_id=prediction["message_id"],
             text=msg
         )
-        print(f"✏️ Прогноз обновлен")
+        print(f"  ✏️ Прогноз обновлен")
     except Exception as e:
-        print(f"❌ Ошибка обновления прогноза: {e}")
+        print(f"  ❌ Ошибка обновления прогноза: {e}")
 
 def reset_prediction():
     """Сбрасывает прогноз"""
@@ -409,7 +431,6 @@ def reset_prediction():
     for key in prediction:
         if key != "dogen_level":
             prediction[key] = None if key not in ["active", "checked"] else False
-    prediction["dogen_level"] = dogen
     prediction["active"] = False
     prediction["checked"] = False
 
@@ -420,21 +441,26 @@ def reset_prediction():
 def main():
     global game_counter, processed_game_ids, history
     
-    print("🚀 ЗАПУСК БОТА БАККАРА (FULL CARD ACCESS)")
-    print("=" * 60)
-    print("📡 Бот видит все карты через API:")
-    print("  - Карты игрока (P1)")
-    print("  - Карты дилера (P2)")
-    print("  - Масть и значение каждой карты")
+    print("\n🚀 ЗАПУСК ОСНОВНОГО ЦИКЛА")
     print("=" * 60)
     
     # Начальный сбор данных
     try:
+        print("📡 Начальный сбор завершенных игр...")
         games = get_active_games()
-        for g in games:
+        print(f"📊 Найдено {len(games)} игр в списке")
+        
+        completed = 0
+        for i, g in enumerate(games):
             gid = g.get("I")
             sc = g.get("SC", {})
-            if sc.get("CPS") == "Игра завершена":
+            cps = sc.get("CPS", "")
+            is_finished = cps == "Игра завершена"
+            
+            print(f"  Игра {i+1}: ID={gid}, Статус='{cps}', Завершена={is_finished}")
+            
+            if is_finished:
+                completed += 1
                 cards_info, _ = get_game_card_info(gid)
                 if cards_info and cards_info.get("player"):
                     first = cards_info["player"][0]
@@ -442,11 +468,16 @@ def main():
                         history.append(first["value"])
                         processed_game_ids.add(gid)
                         game_counter += 1
+                    print(f"    ✅ Добавлена в историю: {first['full']}")
+                else:
+                    print(f"    ⚠️ Нет карт для игры {gid}")
         
-        print(f"📊 Загружено {game_counter} завершенных игр")
+        print(f"📊 Загружено {completed} завершенных игр")
         print(f"📊 В истории {len(history)} карт")
     except Exception as e:
         print(f"⚠️ Ошибка начальной загрузки: {e}")
+    
+    print("\n🔄 Запуск основного цикла...\n")
     
     # Основной цикл
     while True:
@@ -456,35 +487,39 @@ def main():
             for g in games:
                 gid = g.get("I")
                 sc = g.get("SC", {})
-                is_finished = sc.get("CPS") == "Игра завершена"
+                cps = sc.get("CPS", "")
+                is_finished = cps == "Игра завершена"
                 
-                if not is_finished or gid in processed_game_ids:
+                # Пропускаем уже обработанные
+                if gid in processed_game_ids:
                     continue
                 
-                # Получаем карты
-                cards_info, _ = get_game_card_info(gid)
-                if not cards_info or not cards_info.get("player"):
-                    continue
-                
-                with state_lock:
-                    processed_game_ids.add(gid)
-                    first_card = cards_info["player"][0]
-                    first_value = first_card["value"]
-                    first_suit = first_card["suit"]
+                if is_finished:
+                    print(f"\n🎮 Найдена завершенная игра {gid}")
                     
-                    history.append(first_value)
-                    game_counter += 1
+                    cards_info, _ = get_game_card_info(gid)
+                    if not cards_info or not cards_info.get("player"):
+                        print(f"  ⚠️ Нет карт для игры {gid}")
+                        processed_game_ids.add(gid)  # Добавляем чтобы не проверять снова
+                        continue
                     
-                    game_num = get_utc_game_number()
-                    
-                    # Показываем все карты в игре
-                    all_cards = ", ".join([c["full"] for c in cards_info.get("all", [])])
-                    print(f"📝 Игра #{game_num} | Первая: {first_card['full']} | Все карты: {all_cards}")
-                    
-                    # Обрабатываем игру
-                    process_completed_game(game_num, first_value, first_suit, cards_info)
+                    with state_lock:
+                        processed_game_ids.add(gid)
+                        first_card = cards_info["player"][0]
+                        first_value = first_card["value"]
+                        first_suit = first_card["suit"]
+                        
+                        history.append(first_value)
+                        game_counter += 1
+                        
+                        game_num = get_utc_game_number()
+                        
+                        all_cards = ", ".join([c["full"] for c in cards_info.get("all", [])])
+                        print(f"  📝 Игра #{game_num} | Первая: {first_card['full']} | Все: {all_cards}")
+                        
+                        process_completed_game(game_num, first_value, first_suit, cards_info)
             
-            time.sleep(1)
+            time.sleep(2)
             
         except Exception as e:
             print(f"⚠️ Ошибка в основном цикле: {e}")
