@@ -119,7 +119,7 @@ def log_game(game_num, gid, status, cards_info=None):
 
 def send_prediction(suit_code, game_num, target_num, game_id):
     suit = SUITS.get(suit_code, {})
-    msg = f"🎯 ПРОГНОЗ МАСТИ ИГРОКА\n\n Триггер: #{game_num} (ID: {game_id})\n♦️ Масть: {suit.get('symbol')} {suit.get('name')}\n🎯 Целевая игра: #{target_num}\n⏳ Ожидание..."
+    msg = f"🎯 ПРОГНОЗ МАСТИ ИГРОКА\n\n Триггер: #{game_num} (ID: {game_id})\n Масть: {suit.get('symbol')} {suit.get('name')}\n🎯 Целевая игра: #{target_num}\n⏳ Ожидание..."
     try:
         sent = bot.send_message(PREDICTION_CHANNEL_ID, msg)
         return sent.message_id
@@ -130,7 +130,7 @@ def send_prediction(suit_code, game_num, target_num, game_id):
 def update_prediction(msg_id, success, details=""):
     try:
         emoji = "✅" if success else "❌"
-        bot.edit_message_text(chat_id=PREDICTION_CHANNEL_ID, message_id=msg_id, text=f" ПРОГНОЗ МАСТИ ИГРОКА\n\n{emoji} {details}")
+        bot.edit_message_text(chat_id=PREDICTION_CHANNEL_ID, message_id=msg_id, text=f"🎯 ПРОГНОЗ МАСТИ ИГРОКА\n\n Триггер: #{game_num} (ID: {game_id})\n Масть: {suit.get('symbol')} {suit.get('name')}\n🎯 Целевая игра: #{target_num}\n\n{emoji} {details}")
     except: pass
 
 def print_stats():
