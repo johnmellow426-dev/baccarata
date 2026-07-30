@@ -1,13 +1,12 @@
-import requests
-import json
-import time
 import os
+import time
+import json
 import datetime
-import telebot
 import threading
+import requests
 from collections import defaultdict
-from statistics import mean, stdev
-import math
+import telebot
+from telebot.apihelper import ApiTelegramException
 
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -21,7 +20,7 @@ LIST_URL = "https://melbet-5427.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&
 DETAIL_URL_TEMPLATE = "https://melbet-5427.pro/service-api/LiveFeed/GetGameZip?id={game_id}&isSubGames=true&GroupEvents=true&countevents=250&grMode=4&partner=8&topGroups=&country=192&marketType=1&isNewBuilder=true"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json",
     "Referer": "https://melbet-5427.pro/",
 }
@@ -43,7 +42,6 @@ SUITS = {
     3: {"name": "Червы", "symbol": "♥️"}
 }
 
-# Базовая стратегия (на случай, если нет статистики)
 BASE_PREDICTION_STRATEGY = {
     1: [(2, 60), (1, 40)], 2: [(3, 55), (2, 45)], 3: [(4, 50), (8, 50)],
     4: [(5, 55), (9, 45)], 5: [(6, 50), (10, 50)], 6: [(13, 85), (6, 15)],
@@ -53,219 +51,41 @@ BASE_PREDICTION_STRATEGY = {
 }
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
-stats = defaultdict(lambda: defaultdict(int))  # Статистика: trigger_card -> {predicted_card: count}
-success_history = []  # История успешных прогнозов
-game_results = []  # История результатов игр
-prediction_accuracy = defaultdict(float)  # Точность для каждой карты-триггера
-card_correlation = defaultdict(dict)  # Корреляция между картами
+stats = defaultdict(lambda: defaultdict(int))
+success_history = []
+game_results = []
+prediction_accuracy = defaultdict(float)
+card_correlation = defaultdict(dict)
 
-game_counter = 0
-processed_game_ids = set()
-
-prediction = {
-    "active": False,
-    "trigger_game_num": None,
-    "trigger_card": None,
-    "trigger_suit": None,
-    "predicted_value": None,
-    "predicted_symbol": None,
-    "target_game_num": None,
-    "message_id": None,
-    "checked": False,
-    "games_checked": 0,
-    "checked_game_ids": [],
-    "strategy_used": "base"  # base, statistical, correlation, hybrid
-}
-
+# Реестры для отслеживания
+analyzed_trigger_ids = set()
+active_predictions = {}  # {target_game_num: prediction_dict}
 state_lock = threading.Lock()
 
-# --- УМНЫЕ ФУНКЦИИ СТАТИСТИКИ ---
-
-def calculate_prediction_accuracy():
-    """Рассчитывает точность прогнозов для каждой карты-триггера"""
-    with state_lock:
-        for trigger_card in stats:
-            total = sum(stats[trigger_card].values())
-            if total > 0:
-                # Находим самую частую карту
-                most_common = max(stats[trigger_card], key=stats[trigger_card].get)
-                accuracy = stats[trigger_card][most_common] / total
-                prediction_accuracy[trigger_card] = accuracy
-                
-                # Сохраняем корреляцию
-                for card, count in stats[trigger_card].items():
-                    if count > 0:
-                        correlation = count / total
-                        card_correlation[trigger_card][card] = correlation
-
-def get_winning_streak():
-    """Анализирует серию успешных прогнозов"""
-    if len(success_history) < 3:
-        return 0, 0
-    
-    # Считаем последние успехи
-    recent_success = 0
-    for i in range(len(success_history) - 1, -1, -1):
-        if success_history[i]:
-            recent_success += 1
-        else:
-            break
-    
-    # Считаем общий процент успеха
-    total_success = sum(success_history[-50:])  # Последние 50 прогнозов
-    total_attempts = min(len(success_history), 50)
-    success_rate = total_success / total_attempts if total_attempts > 0 else 0
-    
-    return recent_success, success_rate
-
-def get_best_predictions(trigger_card, min_accuracy=0.4):
-    """Возвращает лучшие прогнозы для карты-триггера на основе статистики"""
-    with state_lock:
-        predictions = []
-        
-        # Проверяем статистику
-        if trigger_card in stats and sum(stats[trigger_card].values()) > 5:
-            total = sum(stats[trigger_card].values())
-            for card, count in stats[trigger_card].items():
-                accuracy = count / total
-                if accuracy >= min_accuracy:
-                    predictions.append((card, accuracy))
-            
-            # Сортируем по точности
-            predictions.sort(key=lambda x: x[1], reverse=True)
-            
-            if predictions:
-                return predictions
-        
-        # Если статистики нет, используем базовую стратегию
-        if trigger_card in BASE_PREDICTION_STRATEGY:
-            base = BASE_PREDICTION_STRATEGY[trigger_card]
-            return [(card, prob/100) for card, prob in base]
-        
-        return [(1, 0.5)]  # Дефолтный прогноз
-
-def analyze_trends():
-    """Анализирует тренды в игре"""
-    if len(game_results) < 10:
-        return {}
-    
-    trends = {}
-    # Анализируем последние N игр
-    window = min(20, len(game_results))
-    recent = game_results[-window:]
-    
-    # Считаем частоту каждой карты в последних играх
-    card_freq = defaultdict(int)
-    for cards in recent:
-        for card in cards:
-            card_freq[card] += 1
-    
-    # Находим карты, которые выпадают чаще обычного
-    avg_freq = sum(card_freq.values()) / len(card_freq) if card_freq else 0
-    for card, freq in card_freq.items():
-        if freq > avg_freq * 1.5:  # На 50% выше среднего
-            trends[card] = freq / window
-    
-    return trends
-
-def get_smart_prediction(trigger_card):
-    """Умный выбор прогноза с учетом нескольких факторов"""
-    with state_lock:
-        # 1. Получаем статистические прогнозы
-        stat_predictions = get_best_predictions(trigger_card, min_accuracy=0.35)
-        
-        # 2. Анализируем тренды
-        trends = analyze_trends()
-        
-        # 3. Проверяем текущую серию
-        streak, success_rate = get_winning_streak()
-        
-        # 4. Выбираем стратегию
-        strategy = "hybrid"
-        final_predictions = []
-        
-        for card, acc in stat_predictions:
-            weight = acc  # Базовая точность
-            
-            # Если карта в тренде - увеличиваем вес
-            if card in trends:
-                weight += trends[card] * 0.3
-            
-            # Если есть успешная серия - немного увеличиваем уверенность
-            if streak > 3 and success_rate > 0.6:
-                weight *= 1.1
-            
-            # Проверяем корреляцию
-            if trigger_card in card_correlation and card in card_correlation[trigger_card]:
-                correlation = card_correlation[trigger_card][card]
-                weight += correlation * 0.2
-            
-            final_predictions.append((card, weight))
-        
-        # Сортируем по весу
-        final_predictions.sort(key=lambda x: x[1], reverse=True)
-        
-        # Выбираем лучший прогноз
-        if final_predictions:
-            best_card = final_predictions[0][0]
-            best_score = final_predictions[0][1]
-            
-            # Если уверенность низкая, используем базовую стратегию
-            if best_score < 0.3 and trigger_card in BASE_PREDICTION_STRATEGY:
-                base = BASE_PREDICTION_STRATEGY[trigger_card]
-                best_card = max(base, key=lambda x: x[1])[0]
-                strategy = "base"
-            else:
-                strategy = "hybrid"
-            
-            return best_card, strategy
-        
-        return 1, "base"
-
-def update_smart_statistics(trigger_card, actual_card, success):
-    """Обновляет статистику с умным анализом"""
-    with state_lock:
-        # Обновляем базовую статистику
-        stats[trigger_card][actual_card] += 1
-        
-        # Сохраняем историю успеха
-        success_history.append(success)
-        if len(success_history) > 100:  # Ограничиваем историю
-            success_history.pop(0)
-        
-        # Пересчитываем точность
-        calculate_prediction_accuracy()
-        
-        # Логируем улучшение
-        total = sum(stats[trigger_card].values())
-        if total > 20:
-            accuracy = prediction_accuracy.get(trigger_card, 0)
-            print(f"📊 Статистика для карты {format_card(trigger_card)}: {accuracy*100:.1f}% ({total} прогнозов)")
-
-# --- ОСНОВНЫЕ ФУНКЦИИ ---
-
-def get_utc_game_number():
-    now = datetime.datetime.now(datetime.timezone.utc)
-    return (now.hour * 60) + now.minute + 1
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def normalize_game_num(num):
     while num > 1440: num -= 1440
     while num < 1: num += 1440
     return num
 
+def get_utc_game_number():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return (now.hour * 60) + now.minute + 1
+
 def format_card(card_value):
     return CARD_SYMBOLS.get(card_value, str(card_value))
 
 def format_card_full(card_value, suit_code):
     symbol = CARD_SYMBOLS.get(card_value, str(card_value))
-    suit = SUITS.get(suit_code, {}).get("symbol", "?")
+    suit = SUITS.get(suit_code, {}).get("symbol", "❓")
     return f"{symbol}{suit}"
 
 def parse_cards_from_api(cards_json):
     try:
-        if not cards_json or cards_json == "[]" or cards_json.startswith("Win") or cards_json in ["Win1", "Win2", "Tie"]:
+        if not cards_json or str(cards_json).startswith("Win") or cards_json in ["Win1", "Win2", "Tie"]:
             return []
-        cards = json.loads(cards_json)
+        cards = json.loads(cards_json) if isinstance(cards_json, str) else cards_json
         parsed = []
         for c in cards:
             value = c.get("R") or c.get("CV") or c.get("C", 0)
@@ -306,7 +126,7 @@ def get_all_game_cards(game_data):
 def fetch_game_details(game_id):
     try:
         url = DETAIL_URL_TEMPLATE.format(game_id=game_id)
-        resp = requests.get(url, headers=HEADERS, timeout=3, proxies=NO_PROXY)
+        resp = requests.get(url, headers=HEADERS, timeout=4, proxies=NO_PROXY)
         if resp.status_code == 200:
             return resp.json().get("Value", {})
         return None
@@ -316,7 +136,7 @@ def fetch_game_details(game_id):
 
 def get_active_games():
     try:
-        resp = requests.get(LIST_URL, headers=HEADERS, timeout=3, proxies=NO_PROXY)
+        resp = requests.get(LIST_URL, headers=HEADERS, timeout=4, proxies=NO_PROXY)
         if resp.status_code == 200:
             return resp.json().get("Value", [])
         return []
@@ -324,259 +144,193 @@ def get_active_games():
         print(f"⚠️ Ошибка загрузки списка Live: {e}")
         return []
 
-def get_game_card_info(game_id):
-    game_data = fetch_game_details(game_id)
-    if not game_data:
-        return None, False
-    cards = get_all_game_cards(game_data)
-    is_finished = game_data.get("SC", {}).get("CPS") == "Игра завершена"
-    return cards, is_finished
+# --- АНАЛИТИКА И СТРАТЕГИИ ---
 
-def check_prediction_for_game(cards_info, predicted_value):
-    if not predicted_value:
-        return False, None, None
-    for card in cards_info.get("all", []):
-        val = card["value"]
-        if predicted_value == 1 and val in [1, 14]:
-            return True, val, card["suit"]
-        if val == predicted_value:
-            return True, val, card["suit"]
-    return False, None, None
-
-def process_game_step(game_num, game_id, first_card, first_suit, cards_info, is_finished):
-    global game_counter, game_results
-    
-    with state_lock:
-        # Сохраняем результат игры для анализа трендов
-        all_card_values = [c["value"] for c in cards_info.get("all", [])]
-        if all_card_values:
-            game_results.append(all_card_values)
-            if len(game_results) > 200:  # Ограничиваем историю
-                game_results.pop(0)
-        
-        # Если есть активный прогноз и он еще не проверен полностью
-        if prediction["active"] and not prediction["checked"]:
-            target_num = prediction["target_game_num"]
-            
-            # Проверяем целевую игру и 2 следующие
-            if game_num == target_num or (game_num > target_num and game_num - target_num <= 2):
-                if game_id not in prediction["checked_game_ids"]:
-                    prediction["checked_game_ids"].append(game_id)
-                    prediction["games_checked"] += 1
-                    
-                    is_hit, hit_value, hit_suit = check_prediction_for_game(cards_info, prediction["predicted_value"])
-                    
-                    if is_hit:
-                        offset = game_num - target_num
-                        emoji_map = {0: "✅0️⃣", 1: "✅1️⃣", 2: "✅2️⃣"}
-                        result_text = f"{emoji_map[offset]} (на {offset+1}-й игре)\n🃏 Найдена: {format_card_full(hit_value, hit_suit)}"
-                        update_prediction_message(result_text, True)
-                        print(f"🎯 ПРОГНОЗ СБЫЛСЯ! Игра #{offset+1}")
-                        
-                        # Обновляем статистику с успехом
-                        update_smart_statistics(prediction["trigger_card"], prediction["predicted_value"], True)
-                        prediction["checked"] = True
-                        reset_prediction()
-                        
-                    elif prediction["games_checked"] >= 3 or (prediction["games_checked"] >= 2 and is_finished):
-                        actual_cards = ", ".join([c["full"] for c in cards_info.get("all", [])[:3]])
-                        result_text = f"❌ НЕ СБЫЛСЯ ({prediction['games_checked']} попыток)\n🃏 Выпали: {actual_cards}"
-                        update_prediction_message(result_text, False)
-                        print(f"❌ ПРОГНОЗ НЕ СБЫЛСЯ")
-                        
-                        # Обновляем статистику с неудачей
-                        update_smart_statistics(prediction["trigger_card"], prediction["predicted_value"], False)
-                        prediction["checked"] = True
-                        reset_prediction()
-
-        # Создаем новый прогноз, если нет активного
-        if not prediction["active"] and first_card:
-            create_smart_prediction(game_num, first_card, first_suit)
-
-def create_smart_prediction(trigger_num, trigger_card, trigger_suit):
-    if prediction["active"]:
-        return
-    
-    # Используем умную стратегию
-    pred_value, strategy = get_smart_prediction(trigger_card)
-    pred_symbol = format_card(pred_value)
-    target_num = normalize_game_num(trigger_num + 3)
-    
-    prediction["active"] = True
-    prediction["trigger_game_num"] = trigger_num
-    prediction["trigger_card"] = trigger_card
-    prediction["trigger_suit"] = trigger_suit
-    prediction["predicted_value"] = pred_value
-    prediction["predicted_symbol"] = pred_symbol
-    prediction["target_game_num"] = target_num
-    prediction["message_id"] = None
-    prediction["checked"] = False
-    prediction["games_checked"] = 0
-    prediction["checked_game_ids"] = []
-    prediction["strategy_used"] = strategy
-    
-    send_smart_prediction_message(trigger_num, trigger_card, trigger_suit, pred_symbol, target_num, strategy)
-    print(f"🎯 НОВЫЙ ПРОГНОЗ: #{trigger_num} ({format_card_full(trigger_card, trigger_suit)}) -> #{target_num} ({pred_symbol}) [Стратегия: {strategy}]")
-
-def send_smart_prediction_message(trigger_num, trigger_card, trigger_suit, pred_symbol, target_num, strategy):
-    trigger_full = format_card_full(trigger_card, trigger_suit)
-    
-    # Добавляем информацию о стратегии и уверенности
-    strategy_emoji = {
-        "base": "📊",
-        "statistical": "📈",
-        "correlation": "🔗",
-        "hybrid": "🧠"
-    }
-    strategy_names = {
-        "base": "Базовая",
-        "statistical": "Статистическая",
-        "correlation": "Корреляционная",
-        "hybrid": "Гибридная (умная)"
-    }
-    
-    # Показываем точность для этой карты
-    accuracy = prediction_accuracy.get(trigger_card, 0) * 100
-    accuracy_text = f"{accuracy:.1f}%" if accuracy > 0 else "Нет данных"
-    
-    # Показываем серию успехов
-    streak, success_rate = get_winning_streak()
-    streak_text = f"🔥 {streak} подряд" if streak > 0 else "🔄 Нет серии"
-    success_rate_text = f"{(success_rate*100):.1f}%" if success_rate > 0 else "Нет данных"
-    
-    msg = (
-        f"🎯 ПРОГНОЗ БАККАРА\n"
-        f"─────────────────\n"
-        f"📌 Триггер: игра #{trigger_num}\n"
-        f"🃏 Первая карта: {trigger_full}\n"
-        f"─────────────────\n"
-        f"🎯 Прогноз: {pred_symbol}\n"
-        f"🎯 Игра: #{target_num}\n"
-        f"📊 Проверка: 3 игры\n"
-        f"─────────────────\n"
-        f"🧠 Стратегия: {strategy_names.get(strategy, 'Гибридная')}\n"
-        f"📈 Точность карты: {accuracy_text}\n"
-        f"🔥 Серия: {streak_text}\n"
-        f"📊 Успешность: {success_rate_text}\n"
-        f"─────────────────\n"
-        f"⏳ Ожидание результата..."
-    )
-    try:
-        sent = bot.send_message(PREDICTION_CHANNEL_ID, msg)
-        prediction["message_id"] = sent.message_id
-    except Exception as e:
-        print(f"❌ Ошибка отправки сообщения: {e}")
-
-def update_prediction_message(result_text, success):
-    if not prediction["message_id"]: return
-    
-    trigger_num = prediction["trigger_game_num"]
-    trigger_card = prediction["trigger_card"]
-    trigger_suit = prediction["trigger_suit"]
-    pred_symbol = prediction["predicted_symbol"]
-    target_num = prediction["target_game_num"]
-    trigger_full = format_card_full(trigger_card, trigger_suit)
-    strategy = prediction.get("strategy_used", "hybrid")
-    
-    strategy_names = {
-        "base": "Базовая",
-        "statistical": "Статистическая",
-        "correlation": "Корреляционная",
-        "hybrid": "Гибридная (умная)"
-    }
-    
-    accuracy = prediction_accuracy.get(trigger_card, 0) * 100
-    accuracy_text = f"{accuracy:.1f}%" if accuracy > 0 else "Нет данных"
-    
-    streak, success_rate = get_winning_streak()
-    streak_text = f"🔥 {streak} подряд" if streak > 0 else "🔄 Нет серии"
-    success_rate_text = f"{(success_rate*100):.1f}%" if success_rate > 0 else "Нет данных"
-    
-    result_emoji = "✅" if success else "❌"
-    
-    msg = (
-        f"🎯 ПРОГНОЗ БАККАРА\n"
-        f"─────────────────\n"
-        f"📌 Триггер: игра #{trigger_num}\n"
-        f"🃏 Первая карта: {trigger_full}\n"
-        f"─────────────────\n"
-        f"🎯 Прогноз: {pred_symbol}\n"
-        f"🎯 Игра: #{target_num}\n"
-        f"📊 Проверка: 3 игры\n"
-        f"─────────────────\n"
-        f"🧠 Стратегия: {strategy_names.get(strategy, 'Гибридная')}\n"
-        f"📈 Точность карты: {accuracy_text}\n"
-        f"🔥 Серия: {streak_text}\n"
-        f"📊 Успешность: {success_rate_text}\n"
-        f"─────────────────\n"
-        f"{result_emoji} Результат: {result_text}"
-    )
-    try:
-        bot.edit_message_text(chat_id=PREDICTION_CHANNEL_ID, message_id=prediction["message_id"], text=msg)
-    except Exception as e:
-        print(f"❌ Ошибка обновления сообщения: {e}")
-
-def reset_prediction():
-    for key in prediction:
-        if key in ["active", "checked"]:
-            prediction[key] = False
-        elif key in ["games_checked"]:
-            prediction[key] = 0
-        elif key in ["checked_game_ids"]:
-            prediction[key] = []
+def get_winning_streak():
+    if len(success_history) < 3:
+        return 0, 0.0
+    recent_success = 0
+    for res in reversed(success_history):
+        if res:
+            recent_success += 1
         else:
-            prediction[key] = None
+            break
+    total_attempts = min(len(success_history), 50)
+    total_success = sum(success_history[-total_attempts:])
+    success_rate = total_success / total_attempts if total_attempts > 0 else 0.0
+    return recent_success, success_rate
+
+def get_smart_prediction(trigger_card):
+    if trigger_card in BASE_PREDICTION_STRATEGY:
+        options = BASE_PREDICTION_STRATEGY[trigger_card]
+        best_card = max(options, key=lambda x: x[1])[0]
+        return best_card, "base"
+    return 1, "base"
+
+# --- ПУБЛИКАЦИЯ И ОБНОВЛЕНИЕ В TELEGRAM ---
+
+def send_prediction_telegram(pred):
+    trigger_full = format_card_full(pred["trigger_card"], pred["trigger_suit"])
+    accuracy = prediction_accuracy.get(pred["trigger_card"], 0) * 100
+    accuracy_text = f"{accuracy:.1f}%" if accuracy > 0 else "Накопление данных"
+    
+    streak, success_rate = get_winning_streak()
+    streak_text = f"🔥 {streak} в ряд" if streak > 0 else "➖"
+    
+    msg = (
+        f"🎯 **ПРОГНОЗ БАККАРА / 21**\n"
+        f"─────────────────\n"
+        f"📌 Триггер: Игра **#{pred['trigger_game_num']}**\n"
+        f"🃏 Первая карта: **{trigger_full}**\n"
+        f"─────────────────\n"
+        f"🎯 Прогноз карт(ы): **{pred['predicted_symbol']}**\n"
+        f"🎯 Целевая игра: **#{pred['target_game_num']}** (до +2 итераций)\n"
+        f"🧠 Стратегия: {pred['strategy'].capitalize()}\n"
+        f"📈 Точность триггера: {accuracy_text}\n"
+        f"🔥 Серия: {streak_text}\n"
+        f"─────────────────\n"
+        f"⏳ Ожидаем результат..."
+    )
+    try:
+        sent = bot.send_message(PREDICTION_CHANNEL_ID, msg, parse_mode="Markdown")
+        pred["message_id"] = sent.message_id
+        print(f"📢 Прогноз опубликован в канал (ID: {sent.message_id})")
+    except Exception as e:
+        print(f"❌ Ошибка отправки прогноза в Telegram: {e}")
+
+def update_prediction_telegram(pred, result_text, success):
+    if not pred.get("message_id"):
+        return
+
+    trigger_full = format_card_full(pred["trigger_card"], pred["trigger_suit"])
+    result_emoji = "✅" if success else "❌"
+
+    msg = (
+        f"🎯 **ПРОГНОЗ БАККАРА / 21**\n"
+        f"─────────────────\n"
+        f"📌 Триггер: Игра **#{pred['trigger_game_num']}**\n"
+        f"🃏 Первая карта: **{trigger_full}**\n"
+        f"─────────────────\n"
+        f"🎯 Прогноз: **{pred['predicted_symbol']}**\n"
+        f"🎯 Целевая игра: **#{pred['target_game_num']}**\n"
+        f"─────────────────\n"
+        f"{result_emoji} **Результат:** {result_text}"
+    )
+    try:
+        bot.edit_message_text(
+            chat_id=PREDICTION_CHANNEL_ID,
+            message_id=pred["message_id"],
+            text=msg,
+            parse_mode="Markdown"
+        )
+    except ApiTelegramException as e:
+        if "message is not modified" not in str(e):
+            print(f"⚠️ Ошибка Telegram API при обновлении: {e}")
+    except Exception as e:
+        print(f"❌ Непредвиденная ошибка редактирования сообщения: {e}")
+
+# --- ОСНОВНОЙ ЦИКЛ ОБРАБОТКИ ---
+
+def process_live_games():
+    games = get_active_games()
+    if not games:
+        return
+
+    for g in games:
+        gid = g.get("I")
+        if not gid:
+            continue
+
+        # Извлекаем подробную информацию об игре
+        game_data = fetch_game_details(gid)
+        if not game_data:
+            continue
+
+        cards_info = get_all_game_cards(game_data)
+        is_finished = game_data.get("SC", {}).get("CPS") == "Игра завершена"
+
+        # Извлекаем номер игры из структуры BК
+        game_num = get_utc_game_number()
+
+        player_cards = cards_info.get("player", [])
+        if not player_cards:
+            continue
+
+        first_card = player_cards[0]
+        first_val = first_card["value"]
+        first_suit = first_card["suit"]
+
+        with state_lock:
+            # 1. ОБРАБОТКА И СОЗДАНИЕ НОВОГО ПРОГНОЗА
+            if gid not in analyzed_trigger_ids:
+                analyzed_trigger_ids.add(gid)
+                
+                # Генерация прогноза на N+3 игру
+                target_num = normalize_game_num(game_num + 3)
+                pred_val, strategy = get_smart_prediction(first_val)
+                pred_symbol = format_card(pred_val)
+
+                new_pred = {
+                    "trigger_game_num": game_num,
+                    "trigger_card": first_val,
+                    "trigger_suit": first_suit,
+                    "predicted_value": pred_val,
+                    "predicted_symbol": pred_symbol,
+                    "target_game_num": target_num,
+                    "strategy": strategy,
+                    "message_id": None,
+                    "checked_games_count": 0,
+                    "checked_game_ids": set()
+                }
+
+                active_predictions[target_num] = new_pred
+                send_prediction_telegram(new_pred)
+                print(f"🎯 Сгенерирован прогноз: Игра #{game_num} ({format_card_full(first_val, first_suit)}) -> На цель #{target_num} [{pred_symbol}]")
+
+            # 2. ПРОВЕРКА АКТИВНЫХ ПРОГНОЗОВ В ТЕКУЩЕЙ ИГРЕ
+            to_remove = []
+            for target_num, pred in active_predictions.items():
+                # Проверяем диапазон: целевая игра и 2 последующие догоном
+                diff = normalize_game_num(game_num - target_num)
+                if 0 <= diff <= 2:
+                    if gid not in pred["checked_game_ids"]:
+                        pred["checked_game_ids"].add(gid)
+                        pred["checked_games_count"] += 1
+
+                        # Проверка наличия угаданной карты
+                        all_game_cards = cards_info.get("all", [])
+                        hit_card = next((c for c in all_game_cards if c["value"] == pred["predicted_value"] or (pred["predicted_value"] == 1 and c["value"] in [1, 14])), None)
+
+                        if hit_card:
+                            res_str = f"✅ УГАДАНО на {diff + 1}-м шаге!\n🃏 Найдена: **{hit_card['full']}**"
+                            update_prediction_telegram(pred, res_str, True)
+                            success_history.append(True)
+                            stats[pred["trigger_card"]][pred["predicted_value"]] += 1
+                            to_remove.append(target_num)
+                            print(f"✅ Прогноз #{target_num} ЗАШЕЛ!")
+                        elif pred["checked_games_count"] >= 3 or is_finished:
+                            if pred["checked_games_count"] >= 3:
+                                actual_str = ", ".join([c["full"] for c in all_game_cards[:4]])
+                                res_str = f"❌ НЕ СБЫЛСЯ (3 попытки исчерпаны)\n🃏 Карты матча: {actual_str}"
+                                update_prediction_telegram(pred, res_str, False)
+                                success_history.append(False)
+                                to_remove.append(target_num)
+                                print(f"❌ Прогноз #{target_num} НЕ зашел.")
+
+            for t_num in to_remove:
+                del active_predictions[t_num]
 
 def main():
-    global game_counter, processed_game_ids
-    print("\n🚀 ЗАПУСК УМНОГО МОНИТОРИНГА LIVE")
+    print("\n🚀 ЗАПУСК МОНИТОРИНГА LIVE И АВТО-ПУБЛИКАЦИИ")
     print("=" * 60)
-    print("🧠 Стратегии:")
-    print("  - Базовая: начальная стратегия")
-    print("  - Статистическая: на основе накопленных данных")
-    print("  - Корреляционная: анализ связей между картами")
-    print("  - Гибридная: комбинация всех стратегий")
-    print("=" * 60)
-    
-    # Инициализируем статистику
-    calculate_prediction_accuracy()
     
     while True:
         try:
-            games = get_active_games()
-            
-            for g in games:
-                gid = g.get("I")
-                if not gid:
-                    continue
-                
-                cards_info, is_finished = get_game_card_info(gid)
-                
-                if not cards_info or not cards_info.get("player"):
-                    continue
-                
-                first_card = cards_info["player"][0]
-                first_value = first_card["value"]
-                first_suit = first_card["suit"]
-                
-                if gid not in processed_game_ids:
-                    game_counter += 1
-                    game_num = get_utc_game_number()
-                    
-                    all_cards = ", ".join([c["full"] for c in cards_info.get("all", [])])
-                    status_str = "Завершена" if is_finished else "ИДЕТ (LIVE)"
-                    print(f"🎮 Игра {gid} (#{game_num}) [{status_str}] | Первая: {first_card['full']} | Карты: {all_cards}")
-                    
-                    if is_finished:
-                        processed_game_ids.add(gid)
-                    
-                    process_game_step(game_num, gid, first_value, first_suit, cards_info, is_finished)
-            
-            time.sleep(2)
-            
+            process_live_games()
+            time.sleep(2.5)  # Пауза между итерациями опроса
         except Exception as e:
-            print(f"⚠️ Ошибка главного цикла: {e}")
-            time.sleep(3)
+            print(f"⚠️ Ошибка в основном цикле: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
