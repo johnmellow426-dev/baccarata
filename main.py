@@ -13,45 +13,29 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 PREDICTION_CHANNEL_ID = os.getenv("PREDICTION_CHANNEL_ID", CHANNEL_ID)
 
-print(f"🔑 BOT_TOKEN: {'✅' if BOT_TOKEN else '❌ НЕ НАЙДЕН'}")
-print(f"📢 CHANNEL_ID: {'✅' if CHANNEL_ID else '❌ НЕ НАЙДЕН'}")
-
-LIST_URL = "https://melbet-5427.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
+LIST_URL = "https://melbet-5427.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true&virtualSports=true"
 DETAIL_URL_TEMPLATE = "https://melbet-5427.pro/service-api/LiveFeed/GetGameZip?id={game_id}&isSubGames=true&GroupEvents=true&countevents=250&grMode=4&partner=8&topGroups=&country=192&marketType=1&isNewBuilder=true"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json",
-    "Referer": "https://melbet-5427.pro/",
 }
-NO_PROXY = {"http": None, "https": None}
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
 # --- КОНСТАНТЫ ---
-CARD_SYMBOLS = {
-    1: "A", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6",
-    7: "7", 8: "8", 9: "9", 10: "10",
-    11: "J", 12: "Q", 13: "K", 14: "A"
-}
-
 SUITS = {
-    0: {"name": "Пики", "symbol": "♠️"},
+    0: {"name": "Пики", "symbol": "️"},
     1: {"name": "Трефы", "symbol": "♣️"},
     2: {"name": "Бубны", "symbol": "♦️"},
     3: {"name": "Червы", "symbol": "♥️"}
 }
 
-BASE_PREDICTION_STRATEGY = {
-    1: [(2, 60), (1, 40)], 2: [(3, 55), (2, 45)], 3: [(4, 50), (8, 50)],
-    4: [(5, 55), (9, 45)], 5: [(6, 50), (10, 50)], 6: [(13, 85), (6, 15)],
-    7: [(12, 80), (7, 20)], 8: [(11, 80), (8, 20)], 9: [(12, 65), (9, 35)],
-    10: [(12, 60), (10, 40)], 11: [(1, 70), (11, 30)], 12: [(1, 70), (12, 30)],
-    13: [(1, 75), (13, 25)], 14: [(2, 60), (1, 40)]
-}
+# --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
+processed_game_ids = set()
+logged_game_ids = set()
+prediction_created_for_game = set()  # НОВОЕ: отслеживаем созданные прогнозы
 
-# --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ОБУЧЕНИЯ И СОСТОЯНИЯ ---
-id_card_stats = defaultdict(lambda: defaultdict(int))
 active_suit_prediction = {
     "active": False,
     "message_id": None,
@@ -63,304 +47,165 @@ active_suit_prediction = {
     "checked_game_ids": set()
 }
 
-processed_game_ids = set()
-logged_game_ids = set()
 state_lock = threading.Lock()
 
-# Добавляем счетчик циклов для диагностики
-cycle_counter = 0
-
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И АНАЛИЗАТОР ID ---
-
-def analyze_game_id(game_id):
-    """Анализирует числовые закономерности ID раздачи."""
-    gid_int = int(game_id)
-    digits_sum = sum(int(d) for d in str(game_id) if d.isdigit())
-    
-    player_suit_code = gid_int % 4
-    card_by_id = (digits_sum % 13) + 1
-    
-    return {
-        "player_suit_code": player_suit_code,
-        "player_suit": SUITS.get(player_suit_code, {}),
-        "digits_sum": digits_sum,
-        "card_by_id": card_by_id
-    }
+def get_utc_game_number():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return (now.hour * 60) + now.minute + 1
 
 def normalize_game_num(num):
     while num > 1440: num -= 1440
     while num < 1: num += 1440
     return num
 
-def get_utc_game_number():
-    now = datetime.datetime.now(datetime.timezone.utc)
-    return (now.hour * 60) + now.minute + 1
-
-def format_card(card_value):
-    return CARD_SYMBOLS.get(card_value, str(card_value))
-
-def format_card_full(card_value, suit_code):
-    symbol = CARD_SYMBOLS.get(card_value, str(card_value))
-    suit = SUITS.get(suit_code, {}).get("symbol", "❓")
-    return f"{symbol}{suit}"
-
-def parse_cards_from_api(cards_json):
-    try:
-        if not cards_json or str(cards_json).startswith("Win") or cards_json in ["Win1", "Win2", "Tie"]:
-            return []
-        cards = json.loads(cards_json) if isinstance(cards_json, str) else cards_json
-        parsed = []
-        for c in cards:
-            value = c.get("R") or c.get("CV") or c.get("C", 0)
-            suit = c.get("S") or c.get("CS") or c.get("Suit", 0)
-            if value > 0:
-                parsed.append({
-                    "value": value,
-                    "suit": suit,
-                    "symbol": format_card(value),
-                    "full": format_card_full(value, suit)
-                })
-        return parsed
-    except Exception as e:
-        return []
-
-def get_all_game_cards(game_data):
-    result = {"player": [], "dealer": [], "all": [], "result": None}
-    try:
-        sc = game_data.get("SC", {})
-        s_list = sc.get("S", [])
-        for item in s_list:
-            key = item.get("Key", "")
-            value = item.get("Value", "")
-            if key == "S":
-                result["result"] = value
-                continue
-            cards = parse_cards_from_api(value)
-            if key == "P":
-                result["player"] = cards
-                result["all"].extend(cards)
-            elif key == "B":
-                result["dealer"] = cards
-                result["all"].extend(cards)
-        return result
-    except Exception:
-        return result
-
 def fetch_game_details(game_id):
     try:
         url = DETAIL_URL_TEMPLATE.format(game_id=game_id)
-        resp = requests.get(url, headers=HEADERS, timeout=4, proxies=NO_PROXY)
+        resp = requests.get(url, headers=HEADERS, timeout=5)
         if resp.status_code == 200:
-            data = resp.json()
-            return data.get("Value", {})
-        else:
-            print(f"⚠️ Ошибка HTTP {resp.status_code} для игры {game_id}")
-            return None
-    except Exception as e:
-        print(f"⚠️ Ошибка сети при запросе игры {game_id}: {e}")
-        return None
+            return resp.json().get("Value", {})
+    except:
+        pass
+    return None
 
 def get_active_games():
     try:
-        resp = requests.get(LIST_URL, headers=HEADERS, timeout=4, proxies=NO_PROXY)
+        resp = requests.get(LIST_URL, headers=HEADERS, timeout=5)
         if resp.status_code == 200:
-            data = resp.json()
-            games = data.get("Value", [])
-            print(f"📊 Загружено {len(games)} игр из API")  # Диагностика
-            return games
-        else:
-            print(f"⚠️ Ошибка HTTP {resp.status_code} при загрузке списка")
+            return resp.json().get("Value", [])
+    except:
+        pass
+    return []
+
+def parse_cards_from_api(cards_json):
+    try:
+        if not cards_json or str(cards_json).startswith("Win"):
             return []
-    except Exception as e:
-        print(f"⚠️ Ошибка загрузки списка Live: {e}")
+        cards = json.loads(cards_json) if isinstance(cards_json, str) else cards_json
+        return [{"value": c.get("R", 0), "suit": c.get("S", 0)} for c in cards if c.get("R", 0) > 0]
+    except:
         return []
 
-def update_id_statistics(game_id, actual_cards):
-    id_analysis = analyze_game_id(game_id)
-    id_mod = id_analysis["card_by_id"]
-    
-    with state_lock:
-        for c in actual_cards:
-            val = c["value"]
-            id_card_stats[id_mod][val] += 1
-
-def predict_card_by_id(game_id):
-    id_analysis = analyze_game_id(game_id)
-    id_mod = id_analysis["card_by_id"]
-    
-    with state_lock:
-        if id_mod in id_card_stats and sum(id_card_stats[id_mod].values()) >= 10:
-            best_card = max(id_card_stats[id_mod], key=id_card_stats[id_mod].get)
-            return best_card, "обучение по ID"
-    
-    return id_mod, "гипотеза по ID"
-
-def send_suit_prediction_telegram():
-    pred = active_suit_prediction
-    suit_info = SUITS.get(pred["predicted_suit_code"], {})
-    suit_str = f"{suit_info.get('symbol', '')} {suit_info.get('name', '')}"
-
-    msg = (
-        f"🎯 **ПРОГНОЗ МАСТИ ПО ID (БАККАРА / 21)**\n"
-        f"─────────────────\n"
-        f"📌 Триггер: Игра **#{pred['trigger_game_num']}** (ID: `{pred['trigger_game_id']}`)\n"
-        f"─────────────────\n"
-        f"♦️ Прогнозируемая масть: **{suit_str}**\n"
-        f"🎯 Целевая игра: **#{pred['target_game_num']}** (до 3 итераций)\n"
-        f"🧠 Модель: Анализ Hash/ID\n"
-        f"─────────────────\n"
-        f"⏳ Статус: Ожидание входа в игры..."
-    )
+def get_all_game_cards(game_data):
+    result = []
     try:
-        sent = bot.send_message(PREDICTION_CHANNEL_ID, msg, parse_mode="Markdown")
-        pred["message_id"] = sent.message_id
-        print(f"📢 [КАНАЛ] Опубликован прогноз масти {suit_str} на целевую игру #{pred['target_game_num']}")
+        for item in game_data.get("SC", {}).get("S", []):
+            if item.get("Key") in ["P", "B"]:
+                result.extend(parse_cards_from_api(item.get("Value")))
+    except:
+        pass
+    return result
+
+def send_prediction(suit_code, game_num, target_num, game_id):
+    suit = SUITS.get(suit_code, {})
+    msg = f"🎯 ПРОГНОЗ МАСТИ\n\n📌 Триггер: #{game_num} (ID: {game_id})\n♦️ Масть: {suit.get('symbol')} {suit.get('name')}\n🎯 Целевая: #{target_num}\n⏳ Ожидание..."
+    
+    try:
+        sent = bot.send_message(PREDICTION_CHANNEL_ID, msg)
+        return sent.message_id
     except Exception as e:
-        print(f"❌ Ошибка отправки прогноза в Telegram: {e}")
+        print(f"❌ Ошибка отправки: {e}")
+        return None
 
-def update_suit_prediction_telegram(result_text, success):
-    pred = active_suit_prediction
-    if not pred["message_id"]:
-        return
-
-    suit_info = SUITS.get(pred["predicted_suit_code"], {})
-    suit_str = f"{suit_info.get('symbol', '')} {suit_info.get('name', '')}"
-    result_emoji = "✅" if success else "❌"
-
-    msg = (
-        f"🎯 **ПРОГНОЗ МАСТИ ПО ID (БАККАРА / 21)**\n"
-        f"─────────────────\n"
-        f"📌 Триггер: Игра **#{pred['trigger_game_num']}**\n"
-        f"♦️ Прогноз масти: **{suit_str}**\n"
-        f"🎯 Целевая игра: **#{pred['target_game_num']}**\n"
-        f"─────────────────\n"
-        f"{result_emoji} **Результат:** {result_text}"
-    )
+def update_prediction(msg_id, success, details=""):
     try:
+        emoji = "✅" if success else "❌"
         bot.edit_message_text(
             chat_id=PREDICTION_CHANNEL_ID,
-            message_id=pred["message_id"],
-            text=msg,
-            parse_mode="Markdown"
+            message_id=msg_id,
+            text=f"🎯 ПРОГНОЗ МАСТИ\n\n{emoji} {details}"
         )
-    except ApiTelegramException as e:
-        if "message is not modified" not in str(e):
-            print(f"⚠️ Ошибка Telegram API при обновлении: {e}")
-    except Exception as e:
-        print(f"❌ Непредвиденная ошибка редактирования сообщения: {e}")
+    except:
+        pass
 
-def reset_active_suit_prediction():
-    with state_lock:
-        active_suit_prediction["active"] = False
-        active_suit_prediction["message_id"] = None
-        active_suit_prediction["trigger_game_num"] = None
-        active_suit_prediction["trigger_game_id"] = None
-        active_suit_prediction["predicted_suit_code"] = None
-        active_suit_prediction["target_game_num"] = None
-        active_suit_prediction["checked_games_count"] = 0
-        active_suit_prediction["checked_game_ids"] = set()
-
-def process_live_games():
-    global cycle_counter
-    cycle_counter += 1
-    
-    print(f"\n🔄 Цикл #{cycle_counter} - Запрос к API...")
-    
+def process_games():
     games = get_active_games()
     if not games:
-        print("⚠️ Нет активных игр или ошибка загрузки")
+        print("⚠️ Нет игр")
         return
 
-    processed_any = False
-    
+    game_num = get_utc_game_number()
+    print(f"🔄 Цикл | Игра #{game_num} | Загружено: {len(games)}")
+
     for g in games:
         gid = g.get("I")
-        if not gid:
+        if not gid or gid in processed_game_ids:
             continue
 
         game_data = fetch_game_details(gid)
         if not game_data:
             continue
 
-        processed_any = True
-        cards_info = get_all_game_cards(game_data)
+        processed_game_ids.add(gid)
+        all_cards = get_all_game_cards(game_data)
         is_finished = game_data.get("SC", {}).get("CPS") == "Игра завершена"
-        game_num = get_utc_game_number()
-        all_cards = cards_info.get("all", [])
 
-        id_analysis = analyze_game_id(gid)
+        # Масть по ID
+        suit_code = int(gid) % 4
+        suit = SUITS.get(suit_code, {})
 
+        # Логирование
+        if gid not in logged_game_ids:
+            logged_game_ids.add(gid)
+            print(f"🆕 #{game_num} ID:{gid} Масть:{suit['symbol']}")
+
+        # Проверка активного прогноза
         with state_lock:
-            # 1. ЛОГИРОВАНИЕ
-            if gid not in logged_game_ids:
-                logged_game_ids.add(gid)
-                pred_card, model_type = predict_card_by_id(gid)
-                print(
-                    f"🆕 Игра #{game_num} (ID: {gid}) | "
-                    f"Масть по ID: {id_analysis['player_suit']['symbol']} {id_analysis['player_suit']['name']} | "
-                    f"Карта: {format_card(pred_card)} ({model_type})"
-                )
-
-            # 2. ОБУЧЕНИЕ
-            if is_finished and gid not in processed_game_ids:
-                processed_game_ids.add(gid)
-                update_id_statistics(gid, all_cards)
-                print(f"📚 Обучили игру #{game_num} (ID: {gid})")
-
-            # 3. ПРОВЕРКА ПРОГНОЗА
             if active_suit_prediction["active"]:
-                target_num = active_suit_prediction["target_game_num"]
-                diff = normalize_game_num(game_num - target_num)
+                target = active_suit_prediction["target_game_num"]
+                diff = normalize_game_num(game_num - target)
 
-                if 0 <= diff <= 2:
-                    if gid not in active_suit_prediction["checked_game_ids"]:
-                        active_suit_prediction["checked_game_ids"].add(gid)
-                        active_suit_prediction["checked_games_count"] += 1
+                if 0 <= diff <= 2 and gid not in active_suit_prediction["checked_game_ids"]:
+                    active_suit_prediction["checked_game_ids"].add(gid)
+                    active_suit_prediction["checked_games_count"] += 1
 
-                        target_suit = active_suit_prediction["predicted_suit_code"]
-                        hit_card = next((c for c in all_cards if c["suit"] == target_suit), None)
+                    target_suit = active_suit_prediction["predicted_suit_code"]
+                    hit = any(c["suit"] == target_suit for c in all_cards)
 
-                        if hit_card:
-                            res_str = f"✅ ЗАШЕЛ на {diff + 1}-й игре!\n🃏 Выпала карта: **{hit_card['full']}**"
-                            update_suit_prediction_telegram(res_str, True)
-                            print(f"🎯 Прогноз масти #{target_num} ЗАШЕЛ!")
-                            reset_active_suit_prediction()
+                    if hit:
+                        update_prediction(
+                            active_suit_prediction["message_id"],
+                            True,
+                            f"ЗАШЁЛ на игре #{game_num}!"
+                        )
+                        print(f"✅ Прогноз зашёл!")
+                        active_suit_prediction["active"] = False
+                    elif active_suit_prediction["checked_games_count"] >= 3 or (is_finished and diff == 2):
+                        update_prediction(
+                            active_suit_prediction["message_id"],
+                            False,
+                            f"НЕ зашёл (3 попытки)"
+                        )
+                        print(f"❌ Прогноз не зашёл")
+                        active_suit_prediction["active"] = False
 
-                        elif active_suit_prediction["checked_games_count"] >= 3 or (is_finished and diff == 2):
-                            actual_str = ", ".join([c["full"] for c in all_cards[:4]]) if all_cards else "Карты не показаны"
-                            res_str = f"❌ НЕ СБЫЛСЯ (3 попытки окончены)\n🃏 Карты: {actual_str}"
-                            update_suit_prediction_telegram(res_str, False)
-                            print(f"❌ Прогноз масти #{target_num} НЕ зашел")
-                            reset_active_suit_prediction()
-
-            # 4. СОЗДАНИЕ НОВОГО ПРОГНОЗА
-            # УБРАЛИ проверку gid not in processed_game_ids, которая блокировала создание прогнозов
-            elif not active_suit_prediction["active"]:
+            # Создание нового прогноза (ТОЛЬКО ОДИН РАЗ на игру)
+            elif not active_suit_prediction["active"] and gid not in prediction_created_for_game:
                 target_num = normalize_game_num(game_num + 3)
+                msg_id = send_prediction(suit_code, game_num, target_num, gid)
 
-                active_suit_prediction["active"] = True
-                active_suit_prediction["trigger_game_num"] = game_num
-                active_suit_prediction["trigger_game_id"] = gid
-                active_suit_prediction["predicted_suit_code"] = id_analysis["player_suit_code"]
-                active_suit_prediction["target_game_num"] = target_num
-                active_suit_prediction["checked_games_count"] = 0
-                active_suit_prediction["checked_game_ids"] = set()
-
-                send_suit_prediction_telegram()
-                print(f"🎯 Создан прогноз на игру #{target_num}")
+                if msg_id:
+                    active_suit_prediction.update({
+                        "active": True,
+                        "message_id": msg_id,
+                        "trigger_game_num": game_num,
+                        "trigger_game_id": gid,
+                        "predicted_suit_code": suit_code,
+                        "target_game_num": target_num,
+                        "checked_games_count": 0,
+                        "checked_game_ids": set()
+                    })
+                    prediction_created_for_game.add(gid)
+                    print(f"🎯 Прогноз на #{target_num}")
 
 def main():
-    print("\n🚀 ЗАПУСК МОНИТОРИНГА (РЕЖИМ: 1 АКТИВНЫЙ ПРОГНОЗ МАСТИ В КАНАЛЕ + ИЗУЧЕНИЕ ID)")
-    print("=" * 65)
-    
+    print("🚀 ЗАПУСК БОТА")
     while True:
         try:
-            process_live_games()
-            time.sleep(2.5)
+            process_games()
+            time.sleep(3)
         except Exception as e:
-            print(f"⚠️ Ошибка в главном цикле: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"⚠️ Ошибка: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
