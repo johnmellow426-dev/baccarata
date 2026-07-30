@@ -16,17 +16,16 @@ STATS_SOURCE_CHANNEL_ID = int(os.getenv("STATS_SOURCE_CHANNEL_ID"))
 API_URL = "https://melbet-2814.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"}
 
-SERIES_START = int(os.getenv("SERIES_START", 4))      # с какой длины серии начинаем публиковать
+SERIES_START = int(os.getenv("SERIES_START", 3))      # длина пары-серии для старта публикаций
 PRED_TIMEOUT = int(os.getenv("PRED_TIMEOUT", 720))
-MAX_ACTIVE   = int(os.getenv("MAX_ACTIVE", 15))
+MAX_ACTIVE   = int(os.getenv("MAX_ACTIVE", 10))
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 lock = threading.Lock()
 
 sent_games   = set()
 active_preds = []
-# текущая серия одинаковых mod4: {mod, dis:[...], published:set}
-current_series = {"mod": None, "dis": [], "published": set()}
+current_series = {"pair": None, "dis": [], "published": set()}   # серия по паре (gid//100)%100
 
 def normalize(n): return ((n - 1) % 1440) + 1
 
@@ -73,20 +72,18 @@ def finalize(pred, success, detail):
     if pred in active_preds: active_preds.remove(pred)
 
 def publish_for(dis):
-    """Публикует прогноз на каждую игру из dis, если ещё не публиковали и есть место."""
     for d in dis:
         if d in current_series["published"]: continue
         with lock:
             if len(active_preds) >= MAX_ACTIVE:
-                print(f"⛔ лимит активных {MAX_ACTIVE}, пропуск #N{d}")
-                continue
+                print(f"⛔ лимит {MAX_ACTIVE}, пропуск #N{d}"); continue
         t = int(d)
         sent = send_prediction(f"🎯 Игра #N{t}\nВозможна Раздача (серия потока)\nпроверка #N{t}\n⏳ Ожидание #R...")
         if sent:
             with lock:
                 active_preds.append({"msg_id": sent.message_id, "target_n": t, "created_at": time.time()})
             current_series["published"].add(d)
-            print(f"🚀 ПРОГНОЗ #N{t} (серия mod4={current_series['mod']}, длина={len(current_series['dis'])})")
+            print(f"🚀 ПРОГНОЗ #N{t} (пара={current_series['pair']}, длина={len(current_series['dis'])})")
 
 @bot.channel_post_handler()
 def on_stats(msg):
@@ -98,26 +95,22 @@ def on_stats(msg):
     print(f"🔎 #N{num} #R={has_nat} | активных={len(active_preds)}")
     with lock:
         for pred in list(active_preds):
-            if num == normalize(pred["target_n"]):     # строго свой номер
+            if num == normalize(pred["target_n"]):
                 if has_nat:
-                    finalize(pred, True, f"#N{num} → Натурал #R")
-                    print(f"🎉 НАТУРАЛ #N{num}")
+                    finalize(pred, True, f"#N{num} → Натурал #R"); print(f"🎉 НАТУРАЛ #N{num}")
                 else:
-                    finalize(pred, False, f"#N{num} без #R")
-                    print(f"❌ нет #R на #N{num}")
+                    finalize(pred, False, f"#N{num} без #R"); print(f"❌ нет #R на #N{num}")
 
 def api_cycle():
     global current_series
     games = fetch_data()
     if not games: return
 
-    # таймауты
     with lock:
         for pred in list(active_preds):
             if time.time() - pred["created_at"] > PRED_TIMEOUT:
                 finalize(pred, False, "⏰ таймаут ожидания #R")
 
-    # новые игры, отсортированы по DI (чтобы серия собиралась по порядку)
     new_games = []
     for game in games:
         gid = game.get("I"); di = game.get("DI")
@@ -131,24 +124,24 @@ def api_cycle():
     for game in new_games:
         gid = game.get("I"); di = game.get("DI")
         if not di: continue
-        m = int(gid) % 4
+        pair = (int(gid) // 100) % 100                      # 🔥 маркер серии
 
-        # ведём текущую серию
-        if m == current_series["mod"]:
-            current_series["dis"].append(di)
+        if current_series["pair"] is not None and pair == (current_series["pair"] + 1) % 100:
+            current_series["dis"].append(di)                 # серия +1
         else:
-            current_series = {"mod": m, "dis": [di], "published": set()}   # обрыв → новая серия
+            current_series = {"pair": pair, "dis": [di], "published": set()}  # обрыв
+        current_series["pair"] = pair
 
-        # серия доросла до порога → публикуем на ВСЕ её игры (ретроактивно + новую)
         if len(current_series["dis"]) >= SERIES_START:
-            publish_for(current_series["dis"])
+            publish_for(current_series["dis"])               # ретроактивно на все игры серии
 
-    if new_games: print(f"✅ Новых игр: {len(new_games)} | серия mod4={current_series['mod']} len={len(current_series['dis'])}")
+    if new_games:
+        print(f"✅ Новых: {len(new_games)} | серия пара={current_series['pair']} len={len(current_series['dis'])}")
     if len(sent_games) > 300: sent_games.clear()
 
 def main():
     print(f"🚀 ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | series_start={SERIES_START} | timeout={PRED_TIMEOUT} | max_active={MAX_ACTIVE}")
-    send_to_channel("🟢 <b>Бот запущен (серийные прогнозы Натурал)</b>")
+    send_to_channel("🟢 <b>Бот запущен (серия по паре ID + Натурал)</b>")
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
     while True:
         try:
