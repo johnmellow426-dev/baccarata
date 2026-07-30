@@ -51,30 +51,44 @@ BASE_PREDICTION_STRATEGY = {
 }
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ОБУЧЕНИЯ И СОСТОЯНИЯ ---
-# Обучение (заполняется ВСЕГДА, независимо от активного прогноза)
-stats = defaultdict(lambda: defaultdict(int))  # trigger_card -> {predicted_card: count}
-prediction_accuracy = defaultdict(float)
-success_history = []
+# Обучение карт на основе суммы цифр ID (id_sum % 13 + 1)
+id_card_stats = defaultdict(lambda: defaultdict(int))  # id_mod -> {predicted_card: count}
 
-# ЕДИНСТВЕННЫЙ АКТИВНЫЙ ПРОГНОЗ В КАНАЛЕ
-active_prediction = {
+# ЕДИНСТВЕННЫЙ АКТИВНЫЙ ПРОГНОЗ НА МАСТЬ В КАНАЛЕ
+active_suit_prediction = {
     "active": False,
     "message_id": None,
     "trigger_game_num": None,
-    "trigger_card": None,
-    "trigger_suit": None,
-    "predicted_value": None,
-    "predicted_symbol": None,
+    "trigger_game_id": None,
+    "predicted_suit_code": None,
     "target_game_num": None,
-    "strategy": "base",
     "checked_games_count": 0,
     "checked_game_ids": set()
 }
 
 processed_game_ids = set()
+logged_game_ids = set()
 state_lock = threading.Lock()
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И АНАЛИЗАТОР ID ---
+
+def analyze_game_id(game_id):
+    """Анализирует числовые закономерности ID раздачи."""
+    gid_int = int(game_id)
+    digits_sum = sum(int(d) for d in str(game_id) if d.isdigit())
+    
+    # 1. Определение масти игроку по ID
+    player_suit_code = gid_int % 4
+    
+    # 2. Определение потенциального достоинства карты по модулю суммы цифр
+    card_by_id = (digits_sum % 13) + 1
+    
+    return {
+        "player_suit_code": player_suit_code,
+        "player_suit": SUITS.get(player_suit_code, {}),
+        "digits_sum": digits_sum,
+        "card_by_id": card_by_id
+    }
 
 def normalize_game_num(num):
     while num > 1440: num -= 1440
@@ -156,82 +170,69 @@ def get_active_games():
         print(f"⚠️ Ошибка загрузки списка Live: {e}")
         return []
 
-# --- УМНЫЙ ВЫБОР ПРОГНОЗА С ОБУЧЕНИЕМ ---
+# --- ИЗУЧЕНИЕ ЗНАЧЕНИЙ ПО ID ---
 
-def get_smart_prediction(trigger_card):
-    """Выбирает карту с опорой на накопленную статистику. Если данных мало — берёт базовую."""
-    with state_lock:
-        if trigger_card in stats and sum(stats[trigger_card].values()) >= 10:
-            total = sum(stats[trigger_card].values())
-            best_card = max(stats[trigger_card], key=stats[trigger_card].get)
-            accuracy = stats[trigger_card][best_card] / total
-            if accuracy >= 0.35:
-                return best_card, "обученная (AI)"
-
-        if trigger_card in BASE_PREDICTION_STRATEGY:
-            options = BASE_PREDICTION_STRATEGY[trigger_card]
-            best_card = max(options, key=lambda x: x[1])[0]
-            return best_card, "базовая"
-
-        return 1, "базовая"
-
-def update_statistics(trigger_card, actual_cards):
-    """Постоянно накапливает статистику по картам для обучения."""
+def update_id_statistics(game_id, actual_cards):
+    """Обучение связи суммы цифр ID с выпадающими картами."""
+    id_analysis = analyze_game_id(game_id)
+    id_mod = id_analysis["card_by_id"]
+    
     with state_lock:
         for c in actual_cards:
             val = c["value"]
-            stats[trigger_card][val] += 1
-            
-        total = sum(stats[trigger_card].values())
-        if total > 0:
-            most_common = max(stats[trigger_card], key=stats[trigger_card].get)
-            prediction_accuracy[trigger_card] = stats[trigger_card][most_common] / total
+            id_card_stats[id_mod][val] += 1
 
-# --- ТЕЛЕГРАМ УВЕДОМЛЕНИЯ ---
-
-def send_prediction_telegram():
-    pred = active_prediction
-    trigger_full = format_card_full(pred["trigger_card"], pred["trigger_suit"])
+def predict_card_by_id(game_id):
+    """Прогноз карты на основе ID."""
+    id_analysis = analyze_game_id(game_id)
+    id_mod = id_analysis["card_by_id"]
     
-    total_samples = sum(stats[pred["trigger_card"]].values())
-    acc = prediction_accuracy.get(pred["trigger_card"], 0) * 100
-    acc_str = f"{acc:.1f}% ({total_samples} игр в базе)" if total_samples > 0 else "Сбор первичных данных"
+    with state_lock:
+        if id_mod in id_card_stats and sum(id_card_stats[id_mod].values()) >= 10:
+            best_card = max(id_card_stats[id_mod], key=id_card_stats[id_mod].get)
+            return best_card, "обучение по ID"
+    
+    return id_mod, "гипотеза по ID"
+
+# --- ТЕЛЕГРАМ УВЕДОМЛЕНИЯ ПРОГНОЗА МАСТИ ---
+
+def send_suit_prediction_telegram():
+    pred = active_suit_prediction
+    suit_info = SUITS.get(pred["predicted_suit_code"], {})
+    suit_str = f"{suit_info.get('symbol', '')} {suit_info.get('name', '')}"
 
     msg = (
-        f"🎯 **ПРОГНОЗ БАККАРА / 21**\n"
+        f"🎯 **ПРОГНОЗ МАСТИ ПО ID (БАККАРА / 21)**\n"
         f"─────────────────\n"
-        f"📌 Триггер: Игра **#{pred['trigger_game_num']}**\n"
-        f"🃏 Первая карта: **{trigger_full}**\n"
+        f"📌 Триггер: Игра **#{pred['trigger_game_num']}** (ID: `{pred['trigger_game_id']}`)\n"
         f"─────────────────\n"
-        f"🎯 Ждем карту: **{pred['predicted_symbol']}**\n"
+        f"♦️ Прогнозируемая масть: **{suit_str}**\n"
         f"🎯 Целевая игра: **#{pred['target_game_num']}** (до 3 итераций)\n"
-        f"🧠 Модель: {pred['strategy'].capitalize()}\n"
-        f"📈 Точность связки: {acc_str}\n"
+        f"🧠 Модель: Анализ Hash/ID\n"
         f"─────────────────\n"
-        f"⏳ Статус: Ожидание входа в игру..."
+        f"⏳ Статус: Ожидание входа в игры..."
     )
     try:
         sent = bot.send_message(PREDICTION_CHANNEL_ID, msg, parse_mode="Markdown")
         pred["message_id"] = sent.message_id
-        print(f"📢 [КАНАЛ] Опубликован единственный активный прогноз #{pred['target_game_num']}")
+        print(f"📢 [КАНАЛ] Опубликован прогноз масти {suit_str} на целевую игру #{pred['target_game_num']}")
     except Exception as e:
         print(f"❌ Ошибка отправки прогноза в Telegram: {e}")
 
-def update_prediction_telegram(result_text, success):
-    pred = active_prediction
+def update_suit_prediction_telegram(result_text, success):
+    pred = active_suit_prediction
     if not pred["message_id"]:
         return
 
-    trigger_full = format_card_full(pred["trigger_card"], pred["trigger_suit"])
+    suit_info = SUITS.get(pred["predicted_suit_code"], {})
+    suit_str = f"{suit_info.get('symbol', '')} {suit_info.get('name', '')}"
     result_emoji = "✅" if success else "❌"
 
     msg = (
-        f"🎯 **ПРОГНОЗ БАККАРА / 21**\n"
+        f"🎯 **ПРОГНОЗ МАСТИ ПО ID (БАККАРА / 21)**\n"
         f"─────────────────\n"
         f"📌 Триггер: Игра **#{pred['trigger_game_num']}**\n"
-        f"🃏 Первая карта: **{trigger_full}**\n"
-        f"─────────────────\n"
-        f"🎯 Прогноз: **{pred['predicted_symbol']}**\n"
+        f"♦️ Прогноз масти: **{suit_str}**\n"
         f"🎯 Целевая игра: **#{pred['target_game_num']}**\n"
         f"─────────────────\n"
         f"{result_emoji} **Результат:** {result_text}"
@@ -249,19 +250,16 @@ def update_prediction_telegram(result_text, success):
     except Exception as e:
         print(f"❌ Непредвиденная ошибка редактирования сообщения: {e}")
 
-def reset_active_prediction():
-    """Сбрасывает состояние активного прогноза для готовности к следующему."""
+def reset_active_suit_prediction():
     with state_lock:
-        active_prediction["active"] = False
-        active_prediction["message_id"] = None
-        active_prediction["trigger_game_num"] = None
-        active_prediction["trigger_card"] = None
-        active_prediction["trigger_suit"] = None
-        active_prediction["predicted_value"] = None
-        active_prediction["predicted_symbol"] = None
-        active_prediction["target_game_num"] = None
-        active_prediction["checked_games_count"] = 0
-        active_prediction["checked_game_ids"] = set()
+        active_suit_prediction["active"] = False
+        active_suit_prediction["message_id"] = None
+        active_suit_prediction["trigger_game_num"] = None
+        active_suit_prediction["trigger_game_id"] = None
+        active_suit_prediction["predicted_suit_code"] = None
+        active_suit_prediction["target_game_num"] = None
+        active_suit_prediction["checked_games_count"] = 0
+        active_suit_prediction["checked_game_ids"] = set()
 
 # --- ОСНОВНАЯ ЛОГИКА ---
 
@@ -282,73 +280,71 @@ def process_live_games():
         cards_info = get_all_game_cards(game_data)
         is_finished = game_data.get("SC", {}).get("CPS") == "Игра завершена"
         game_num = get_utc_game_number()
-
-        player_cards = cards_info.get("player", [])
         all_cards = cards_info.get("all", [])
 
-        if not player_cards:
-            continue
-
-        first_card = player_cards[0]
-        first_val = first_card["value"]
-        first_suit = first_card["suit"]
+        # Анализ ID текущей игры
+        id_analysis = analyze_game_id(gid)
 
         with state_lock:
-            # 1. ФОНОВОЕ ОБУЧЕНИЕ: Каждая завершенная игра питает статистику
+            # 1. ЛОГИРОВАНИЕ И АНАЛИЗ В КОНСОЛЬ
+            if gid not in logged_game_ids:
+                logged_game_ids.add(gid)
+                pred_card, model_type = predict_card_by_id(gid)
+                print(
+                    f"🆕 Начата игра #{game_num} (ID: {gid}) | "
+                    f"Прогноз масти ID: {id_analysis['player_suit']['symbol']} {id_analysis['player_suit']['name']} | "
+                    f"Прогноз карты по ID: {format_card(pred_card)} ({model_type})"
+                )
+
+            # 2. ФОНОВОЕ ОБУЧЕНИЕ ПО ID
             if is_finished and gid not in processed_game_ids:
                 processed_game_ids.add(gid)
-                update_statistics(first_val, all_cards)
+                update_id_statistics(gid, all_cards)
 
-            # 2. ПРОВЕРКА ТЕКУЩЕГО АКТИВНОГО ПРОГНОЗА (если он есть)
-            if active_prediction["active"]:
-                target_num = active_prediction["target_game_num"]
+            # 3. ПРОВЕРКА АКТИВНОГО ПРОГНОЗА МАСТИ
+            if active_suit_prediction["active"]:
+                target_num = active_suit_prediction["target_game_num"]
                 diff = normalize_game_num(game_num - target_num)
 
-                # Проверяем 3 шага (целевая игра, +1, +2)
+                # Проверяем 3 игры подряд (целевая, +1, +2)
                 if 0 <= diff <= 2:
-                    if gid not in active_prediction["checked_game_ids"]:
-                        active_prediction["checked_game_ids"].add(gid)
-                        active_prediction["checked_games_count"] += 1
+                    if gid not in active_suit_prediction["checked_game_ids"]:
+                        active_suit_prediction["checked_game_ids"].add(gid)
+                        active_suit_prediction["checked_games_count"] += 1
 
-                        # Проверяем выпадение нужной карты
-                        hit_card = next((c for c in all_cards if c["value"] == active_prediction["predicted_value"] or (active_prediction["predicted_value"] == 1 and c["value"] in [1, 14])), None)
+                        # Ищем совпадение нужной масти в картах
+                        target_suit = active_suit_prediction["predicted_suit_code"]
+                        hit_card = next((c for c in all_cards if c["suit"] == target_suit), None)
 
                         if hit_card:
                             res_str = f"✅ ЗАШЕЛ на {diff + 1}-й игре!\n🃏 Выпала карта: **{hit_card['full']}**"
-                            update_prediction_telegram(res_str, True)
-                            success_history.append(True)
-                            print(f"🎯 Прогноз #{target_num} ЗАШЕЛ! Канал свободен для нового прогноза.")
-                            reset_active_prediction()
+                            update_suit_prediction_telegram(res_str, True)
+                            print(f"🎯 Прогноз масти #{target_num} ЗАШЕЛ! Канал свободен.")
+                            reset_active_suit_prediction()
 
-                        elif active_prediction["checked_games_count"] >= 3 or (is_finished and diff == 2):
-                            actual_str = ", ".join([c["full"] for c in all_cards[:4]])
-                            res_str = f"❌ НЕ СБЫЛСЯ (3 попытки окончены)\n🃏 Карты последней игры: {actual_str}"
-                            update_prediction_telegram(res_str, False)
-                            success_history.append(False)
-                            print(f"❌ Прогноз #{target_num} НЕ зашел. Канал свободен для нового прогноза.")
-                            reset_active_prediction()
+                        elif active_suit_prediction["checked_games_count"] >= 3 or (is_finished and diff == 2):
+                            actual_str = ", ".join([c["full"] for c in all_cards[:4]]) if all_cards else "Карты не показаны"
+                            res_str = f"❌ НЕ СБЫЛСЯ (3 попытки окончены)\n🃏 Карты: {actual_str}"
+                            update_suit_prediction_telegram(res_str, False)
+                            print(f"❌ Прогноз масти #{target_num} НЕ зашел. Канал свободен.")
+                            reset_active_suit_prediction()
 
-            # 3. СОЗДАНИЕ НОВОГО ПРОГНОЗА (Только если канал пуст!)
-            elif not active_prediction["active"] and gid not in processed_game_ids:
+            # 4. СОЗДАНИЕ НОВОГО ПРОГНОЗА (Только если активных прогнозов НЕТ)
+            elif not active_suit_prediction["active"] and gid not in processed_game_ids:
                 target_num = normalize_game_num(game_num + 3)
-                pred_val, strategy = get_smart_prediction(first_val)
-                pred_symbol = format_card(pred_val)
 
-                active_prediction["active"] = True
-                active_prediction["trigger_game_num"] = game_num
-                active_prediction["trigger_card"] = first_val
-                active_prediction["trigger_suit"] = first_suit
-                active_prediction["predicted_value"] = pred_val
-                active_prediction["predicted_symbol"] = pred_symbol
-                active_prediction["target_game_num"] = target_num
-                active_prediction["strategy"] = strategy
-                active_prediction["checked_games_count"] = 0
-                active_prediction["checked_game_ids"] = set()
+                active_suit_prediction["active"] = True
+                active_suit_prediction["trigger_game_num"] = game_num
+                active_suit_prediction["trigger_game_id"] = gid
+                active_suit_prediction["predicted_suit_code"] = id_analysis["player_suit_code"]
+                active_suit_prediction["target_game_num"] = target_num
+                active_suit_prediction["checked_games_count"] = 0
+                active_suit_prediction["checked_game_ids"] = set()
 
-                send_prediction_telegram()
+                send_suit_prediction_telegram()
 
 def main():
-    print("\n🚀 ЗАПУСК МОНИТОРИНГА (РЕЖИМ: 1 АКТИВНЫЙ ПРОГНОЗ + ФОНОВОЕ ОБУЧЕНИЕ)")
+    print("\n🚀 ЗАПУСК МОНИТОРИНГА (РЕЖИМ: 1 АКТИВНЫЙ ПРОГНОЗ МАСТИ В КАНАЛЕ + ИЗУЧЕНИЕ ID)")
     print("=" * 65)
     
     while True:
