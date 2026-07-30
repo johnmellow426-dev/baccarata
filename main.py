@@ -5,6 +5,7 @@ import datetime
 import threading
 import requests
 import telebot
+from collections import defaultdict
 
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -22,15 +23,31 @@ HEADERS = {
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
 SUITS = {
-    0: {"name": "Пики", "symbol": "️"},
+    0: {"name": "Пики", "symbol": "♠️"},
     1: {"name": "Трефы", "symbol": "♣️"},
     2: {"name": "Бубны", "symbol": "♦️"},
     3: {"name": "Червы", "symbol": "♥️"}
 }
 
+# --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 processed_game_ids = set()
+logged_game_ids = set()
 prediction_created_for_game = set()
-game_history = []  # История всех игр
+
+# 🔥 НОВОЕ: Группировка ID по номеру игры
+games_by_number = defaultdict(list)  # {game_num: [id1, id2, id3, id4]}
+analyzed_games = set()  # Уже проанализированные игры
+
+# Статистика паттернов
+pattern_stats = {
+    "all_4_suits": 0,      # Все 4 масти
+    "three_suits": 0,      # 3 масти
+    "two_suits": 0,        # 2 масти
+    "one_suit": 0,         # 1 масть
+    "total_analyzed": 0
+}
+
+game_history = []
 
 active_suit_prediction = {
     "active": False, "message_id": None, "trigger_game_num": None,
@@ -92,8 +109,62 @@ def get_all_game_cards(game_data):
     except: pass
     return result
 
+def analyze_four_ids(game_num, four_ids):
+    """Анализирует 4 ID для одной игры и возвращает оптимальный"""
+    pattern_stats["total_analyzed"] += 1
+    
+    suits_map = {}  # {suit_code: gid}
+    for gid in four_ids:
+        suit_code = int(gid) % 4
+        suits_map[suit_code] = gid
+    
+    unique_suits = set(suits_map.keys())
+    num_suits = len(unique_suits)
+    
+    # Статистика паттернов
+    if num_suits == 4:
+        pattern_stats["all_4_suits"] += 1
+        pattern_type = "ALL_4"
+    elif num_suits == 3:
+        pattern_stats["three_suits"] += 1
+        pattern_type = "THREE"
+    elif num_suits == 2:
+        pattern_stats["two_suits"] += 1
+        pattern_type = "TWO"
+    else:
+        pattern_stats["one_suit"] += 1
+        pattern_type = "ONE"
+    
+    # 🔥 ВЫБОР ОПТИМАЛЬНОГО ID
+    # Стратегия: если все 4 масти есть → берём первую (или любую по стратегии)
+    # Если не все → берём ID с нужной мастью (если есть)
+    
+    # Для простоты: берём ID с мастью 0 (Пики) как базовый, или первый доступный
+    optimal_id = None
+    optimal_suit = None
+    
+    if 0 in suits_map:  # Есть Пики
+        optimal_id = suits_map[0]
+        optimal_suit = 0
+    elif 1 in suits_map:  # Есть Трефы
+        optimal_id = suits_map[1]
+        optimal_suit = 1
+    elif 2 in suits_map:  # Есть Бубны
+        optimal_id = suits_map[2]
+        optimal_suit = 2
+    elif 3 in suits_map:  # Есть Червы
+        optimal_id = suits_map[3]
+        optimal_suit = 3
+    
+    # Логирование
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+    suits_str = ", ".join([f"{SUITS[s]['symbol']}(ID:{suits_map[s]})" for s in sorted(unique_suits)])
+    print(f"🔍 [{timestamp}] #{game_num} | Паттерн: {pattern_type} | Масти: {suits_str}")
+    print(f"   ✅ Оптимальный ID: {optimal_id} → {SUITS[optimal_suit]['symbol']} {SUITS[optimal_suit]['name']}")
+    
+    return optimal_id, optimal_suit, pattern_type
+
 def log_game(game_num, gid, status, cards_info=None):
-    """Логирование игры в историю и консоль"""
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     suit_code = int(gid) % 4
     suit = SUITS.get(suit_code, {})
@@ -108,7 +179,6 @@ def log_game(game_num, gid, status, cards_info=None):
     }
     game_history.append(entry)
     
-    # Красивый вывод в консоль
     if status == "NEW":
         print(f" [{timestamp}] #{game_num} | ID: {gid} | Масть: {suit['symbol']} {suit['name']} | Статус: Ожидание")
     elif status == "FINISHED":
@@ -119,7 +189,7 @@ def log_game(game_num, gid, status, cards_info=None):
 
 def send_prediction(suit_code, game_num, target_num, game_id):
     suit = SUITS.get(suit_code, {})
-    msg = f"🎯 ПРОГНОЗ МАСТИ ИГРОКА\n\n Триггер: #{game_num} (ID: {game_id})\n Масть: {suit.get('symbol')} {suit.get('name')}\n🎯 Целевая игра: #{target_num}\n⏳ Ожидание..."
+    msg = f"🎯 ПРОГНОЗ МАСТИ ИГРОКА\n\n📌 Триггер: #{game_num} (ID: {game_id})\n Масть: {suit.get('symbol')} {suit.get('name')}\n🎯 Целевая игра: #{target_num}\n⏳ Ожидание..."
     try:
         sent = bot.send_message(PREDICTION_CHANNEL_ID, msg)
         return sent.message_id
@@ -130,18 +200,23 @@ def send_prediction(suit_code, game_num, target_num, game_id):
 def update_prediction(msg_id, success, details=""):
     try:
         emoji = "✅" if success else "❌"
-        bot.edit_message_text(chat_id=PREDICTION_CHANNEL_ID, message_id=msg_id, text=f"🎯 ПРОГНОЗ МАСТИ ИГРОКА\n\n Триггер: #{game_num} (ID: {game_id})\n Масть: {suit.get('symbol')} {suit.get('name')}\n🎯 Целевая игра: #{target_num}\n\n{emoji} {details}")
+        bot.edit_message_text(chat_id=PREDICTION_CHANNEL_ID, message_id=msg_id, text=f"🎯 ПРОГНОЗ МАСТИ ИГРОКА\n\n📌 Триггер: #{game_num} (ID: {game_id})\n Масть: {suit.get('symbol')} {suit.get('name')}\n🎯 Целевая игра: #{target_num}\n⏳{emoji} {details}")
     except: pass
 
 def print_stats():
-    """Вывод статистики"""
     print(f"\n СТАТИСТИКА:")
     print(f"   Всего игр: {stats['total_seen']}")
     print(f"   Завершено: {stats['finished']}")
     print(f"   С картами: {stats['with_cards']}")
     print(f"   Прогнозов: {stats['predictions']}")
     print(f"   ✅ Зашло: {stats['hits']}")
-    print(f"   ❌ Не зашло: {stats['misses']}")
+    print(f"    Не зашло: {stats['misses']}")
+    print(f"\n🔍 СТАТИСТИКА ПАТТЕРНОВ:")
+    print(f"   Проанализировано: {pattern_stats['total_analyzed']}")
+    print(f"   Все 4 масти: {pattern_stats['all_4_suits']}")
+    print(f"   3 масти: {pattern_stats['three_suits']}")
+    print(f"   2 масти: {pattern_stats['two_suits']}")
+    print(f"   1 масть: {pattern_stats['one_suit']}")
     print(f"   В истории: {len(game_history)} записей\n")
 
 def process_games():
@@ -149,56 +224,75 @@ def process_games():
     if not games: return
 
     game_num = get_utc_game_number()
-
+    
+    # 🔥 НОВОЕ: Группируем ID по номеру игры
     for g in games:
         gid = g.get("I")
-        if not gid or gid in processed_game_ids:
+        if not gid:
             continue
-
-        stats["total_seen"] += 1
-        game_data = fetch_game_details(gid)
+        
+        if gid not in logged_game_ids:
+            logged_game_ids.add(gid)
+            stats["total_seen"] += 1
+            
+            # Добавляем ID в группу для этого game_num
+            if game_num not in games_by_number:
+                games_by_number[game_num] = []
+            
+            if gid not in games_by_number[game_num]:
+                games_by_number[game_num].append(gid)
+    
+    # 🔥 НОВОЕ: Анализируем игры с 4 ID
+    for gnum, ids in list(games_by_number.items()):
+        if gnum in analyzed_games or len(ids) < 4:
+            continue
+        
+        # У нас есть 4 ID для этой игры — анализируем
+        analyzed_games.add(gnum)
+        optimal_id, optimal_suit, pattern_type = analyze_four_ids(gnum, ids)
+        
+        # Теперь работаем с optimal_id вместо первого попавшегося
+        game_data = fetch_game_details(optimal_id)
         if not game_data: continue
-
+        
         cards_info = get_all_game_cards(game_data)
         is_finished = cards_info.get("is_finished", False)
         player_cards = cards_info.get("player", [])
-
+        
         if not is_finished:
-            log_game(game_num, gid, "NEW")
+            log_game(gnum, optimal_id, "NEW")
             continue
-
-        processed_game_ids.add(gid)
+        
+        processed_game_ids.add(optimal_id)
         stats["finished"] += 1
-
+        
         if not player_cards:
-            log_game(game_num, gid, "NO_CARDS", cards_info)
+            log_game(gnum, optimal_id, "NO_CARDS", cards_info)
             continue
-
+        
         stats["with_cards"] += 1
-        log_game(game_num, gid, "FINISHED", cards_info)
-
-        suit_code = int(gid) % 4
-        suit = SUITS.get(suit_code, {})
-
+        log_game(gnum, optimal_id, "FINISHED", cards_info)
+        
+        suit = SUITS.get(optimal_suit, {})
+        
         with state_lock:
             if active_suit_prediction["active"]:
                 target = active_suit_prediction["target_game_num"]
-                diff = normalize_game_num(game_num - target)
-
-                if diff > 2 and diff < 1430: 
+                diff = normalize_game_num(gnum - target)
+                
+                if diff > 2 and diff < 1430:
                     update_prediction(active_suit_prediction["message_id"], False, "Время вышло.")
                     stats["misses"] += 1
                     active_suit_prediction["active"] = False
-
-                elif 0 <= diff <= 2 and gid not in active_suit_prediction["checked_game_ids"]:
-                    active_suit_prediction["checked_game_ids"].add(gid)
+                elif 0 <= diff <= 2 and optimal_id not in active_suit_prediction["checked_game_ids"]:
+                    active_suit_prediction["checked_game_ids"].add(optimal_id)
                     active_suit_prediction["checked_games_count"] += 1
                     
                     target_suit = active_suit_prediction["predicted_suit_code"]
                     hit = any(c["suit"] == target_suit for c in player_cards)
-
+                    
                     if hit:
-                        update_prediction(active_suit_prediction["message_id"], True, f"ЗАШЁЛ на #{game_num}!")
+                        update_prediction(active_suit_prediction["message_id"], True, f"ЗАШЁЛ на #{gnum}!")
                         stats["hits"] += 1
                         active_suit_prediction["active"] = False
                         print(f"🎉 ПРОГНОЗ ЗАШЁЛ!")
@@ -206,24 +300,24 @@ def process_games():
                         update_prediction(active_suit_prediction["message_id"], False, "НЕ зашёл (3 попытки).")
                         stats["misses"] += 1
                         active_suit_prediction["active"] = False
-
-            elif not active_suit_prediction["active"] and gid not in prediction_created_for_game:
-                target_num = normalize_game_num(game_num + 3)
-                msg_id = send_prediction(suit_code, game_num, target_num, gid)
+            
+            elif not active_suit_prediction["active"] and optimal_id not in prediction_created_for_game:
+                target_num = normalize_game_num(gnum + 3)
+                msg_id = send_prediction(optimal_suit, gnum, target_num, optimal_id)
                 
                 if msg_id:
                     stats["predictions"] += 1
                     active_suit_prediction.update({
                         "active": True, "message_id": msg_id,
-                        "trigger_game_num": game_num, "trigger_game_id": gid,
-                        "predicted_suit_code": suit_code, "target_game_num": target_num,
+                        "trigger_game_num": gnum, "trigger_game_id": optimal_id,
+                        "predicted_suit_code": optimal_suit, "target_game_num": target_num,
                         "checked_games_count": 0, "checked_game_ids": set()
                     })
-                    prediction_created_for_game.add(gid)
-                    print(f"🚀 Прогноз на #{target_num}")
+                    prediction_created_for_game.add(optimal_id)
+                    print(f"🚀 Прогноз на #{target_num} (ID: {optimal_id})")
 
 def main():
-    print("🚀 ЗАПУСК БОТА С ЛОГИРОВАНИЕМ")
+    print("🚀 ЗАПУСК БОТА С АНАЛИЗОМ 4 ID")
     print("=" * 60)
     
     cycle = 0
@@ -231,7 +325,7 @@ def main():
         try:
             process_games()
             cycle += 1
-            if cycle % 20 == 0:  # Каждые 20 циклов выводим статистику
+            if cycle % 20 == 0:
                 print_stats()
             time.sleep(3)
         except Exception as e:
