@@ -4,14 +4,12 @@ import json
 import datetime
 import requests
 import telebot
-from collections import defaultdict
 
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-STATS_CHANNEL_ID = os.getenv("STATS_CHANNEL_ID")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
 
-LIST_URL = "https://melbet-5427.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
-DETAIL_URL_TEMPLATE = "https://melbet-5427.pro/service-api/LiveFeed/GetGameZip?id={game_id}&isSubGames=true&GroupEvents=true&countevents=250&grMode=4&partner=8&topGroups=&country=192&marketType=1&isNewBuilder=true"
+API_URL = "https://melbet-2814.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -20,285 +18,180 @@ HEADERS = {
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
-SUITS = {
-    0: {"name": "Пики", "symbol": "♠️"},
-    1: {"name": "Трефы", "symbol": "️♣️"},
-    2: {"name": "Бубны", "symbol": "♦️"},
-    3: {"name": "Червы", "symbol": "♥️"}
-}
+# Отслеживание уже отправленных игр
+sent_games = set()
 
-# --- СОСТОЯНИЕ ---
-logged_ids = set()
-games_by_num = defaultdict(list)
-predictions_made_for_num = set()
-
-stats = {"total_seen": 0, "predictions": 0, "hits": 0, "misses": 0}
-patterns = {"4_suits": 0, "3_suits": 0, "2_suits": 0, "1_suit": 0, "total_analyzed": 0}
-
-active_pred = {
-    "active": False, "msg_id": None, "trigger_num": 0, "target_num": 0,
-    "suit_code": 0, "attempts": 0
-}
-
-# 🔥 НОВОЕ: Отслеживание проверенных игр (с очисткой)
-checked_game_nums = set()
-last_summary_time = time.time()
-
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def get_game_num():
-    now = datetime.datetime.now(datetime.timezone.utc)
-    return (now.hour * 60) + now.minute + 1
-
-def normalize(num):
-    while num > 1440: num -= 1440
-    while num < 1: num += 1440
-    return num
-
-def fetch_details(gid):
+def fetch_data():
+    """Получает данные из API"""
     try:
-        resp = requests.get(DETAIL_URL_TEMPLATE.format(game_id=gid), headers=HEADERS, timeout=5)
-        if resp.status_code == 200: return resp.json().get("Value", {})
-    except: pass
-    return None
-
-def get_active_games():
-    try:
-        resp = requests.get(LIST_URL, headers=HEADERS, timeout=5)
-        if resp.status_code == 200: return resp.json().get("Value", [])
-    except: pass
+        resp = requests.get(API_URL, headers=HEADERS, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("Value", [])
+    except Exception as e:
+        print(f"️ Ошибка запроса: {e}")
     return []
 
-def parse_cards(data):
-    player_cards = []
-    is_finished = False
+def format_game_info(game):
+    """Форматирует информацию об игре для Telegram"""
     try:
-        sc = data.get("SC", {})
-        cps = str(sc.get("CPS", "")).lower()
-        is_finished = "завершена" in cps or "finished" in cps or sc.get("GE") == 1
+        # Основные данные
+        game_id = game.get("I", "N/A")
+        sport_name = game.get("SN", "N/A")
+        league_name = game.get("L", "N/A")
         
-        for item in sc.get("S", []):
-            if str(item.get("Key", "")).upper() != "P": continue
-            value = item.get("Value", "")
-            try:
-                if value:
-                    parsed = json.loads(value) if isinstance(value, str) else value
-                    if isinstance(parsed, list):
-                        for c in parsed:
-                            val = c.get("R") or c.get("CV") or c.get("C", 0)
-                            suit = c.get("S") or c.get("CS") or c.get("Suit", 0)
-                            if val and int(val) > 0:
-                                player_cards.append({"value": int(val), "suit": int(suit)})
-            except: pass
-    except: pass
-    return player_cards, is_finished
-
-# --- ТЕЛЕГРАМ ФУНКЦИИ ---
-def send_to_channel(text, parse_mode="HTML"):
-    try:
-        bot.send_message(STATS_CHANNEL_ID, text, parse_mode=parse_mode)
-    except Exception as e:
-        print(f"❌ Ошибка Telegram: {e}")
-
-def update_pred_message(success, details):
-    if not active_pred["msg_id"]: return
-    try:
-        emoji = "✅" if success else ""
+        # Время
+        start_time = game.get("S", 0)
+        if start_time:
+            dt = datetime.datetime.fromtimestamp(start_time)
+            time_str = dt.strftime("%H:%M:%S (%d.%m.%Y)")
+        else:
+            time_str = "N/A"
+        
+        # Участники
+        player_name = game.get("O1", "Игрок")
+        banker_name = game.get("O2", "Банкир")
+        
+        # Коэффициенты (делим на 100)
+        player_coef = game.get("O1C", 0) / 100 if game.get("O1C") else 0
+        banker_coef = game.get("O2C", 0) / 100 if game.get("O2C") else 0
+        
+        # IDs
+        player_id = game.get("O1I", "N/A")
+        banker_id = game.get("O2I", "N/A")
+        
+        # Статус
+        market_status = game.get("MS", [0])
+        status = "🟢 Активен" if market_status and market_status[0] == 0 else "🔴 Закрыт"
+        
+        # Дополнительные поля
+        display_id = game.get("DI", "N/A")
+        event_counter = game.get("EC", "N/A")
+        country = game.get("CN", "World")
+        
         text = (
-            f"🎯 <b>ПРОГНОЗ МАСТИ ИГРОКА</b>\n"
-            f"📌 Триггер: #{active_pred['trigger_num']}\n"
-            f"🃏 Масть: {SUITS[active_pred['suit_code']]['symbol']} {SUITS[active_pred['suit_code']]['name']}\n"
-            f"🎯 Цель: #{active_pred['target_num']}\n\n"
-            f"{emoji} <b>Результат:</b>\n{details}"
+            f"🎮 <b>ИГРА #{game_id}</b>\n"
+            f"{'─' * 30}\n"
+            f"📊 <b>Информация:</b>\n"
+            f"  Спорт: {sport_name}\n"
+            f"  Лига: {league_name}\n"
+            f"  Страна: {country}\n"
+            f"  Старт: {time_str}\n"
+            f"  Статус: {status}\n"
+            f"\n"
+            f"👥 <b>Участники:</b>\n"
+            f"  🔵 {player_name}\n"
+            f"     ├─ ID: {player_id}\n"
+            f"     └─ Коэф: {player_coef:.2f}\n"
+            f"  🔴 {banker_name}\n"
+            f"     ├─ ID: {banker_id}\n"
+            f"     └─ Коэф: {banker_coef:.2f}\n"
+            f"\n"
+            f" <b>Системные данные:</b>\n"
+            f"  Display ID: {display_id}\n"
+            f"  Event Counter: {event_counter}\n"
+            f"  League ID: {game.get('LI', 'N/A')}\n"
+            f"  Sport ID: {game.get('SI', 'N/A')}\n"
         )
-        bot.edit_message_text(chat_id=STATS_CHANNEL_ID, message_id=active_pred["msg_id"], text=text, parse_mode="HTML")
-    except: pass
-
-def reset_pred():
-    active_pred.update({
-        "active": False, "msg_id": None, "trigger_num": 0, 
-        "target_num": 0, "suit_code": 0, "attempts": 0
-    })
-    print("🔄 Прогноз сброшен, готов к новому")
-
-def send_summary():
-    global last_summary_time
-    hit_rate = (stats["hits"] / stats["predictions"] * 100) if stats["predictions"] > 0 else 0
-    text = (
-        f"📊 <b>СВОДНАЯ СТАТИСТИКА</b>\n"
-        f"─────────────────\n"
-        f"👁 Всего ID: {stats['total_seen']}\n"
-        f"🎯 Прогнозов: {stats['predictions']}\n"
-        f" Зашло: {stats['hits']} ({hit_rate:.1f}%)\n"
-        f"🔴 Не зашло: {stats['misses']}\n"
-        f"─────────────────\n"
-        f"🔍 <b>Паттерны:</b> 4={patterns['4_suits']} 3={patterns['3_suits']} 2={patterns['2_suits']} 1={patterns['1_suit']}"
-    )
-    send_to_channel(text)
-    last_summary_time = time.time()
-    print(f"📊 Статистика отправлена")
-
-# --- ОСНОВНАЯ ЛОГИКА ---
-def process_games():
-    games = get_active_games()
-    if not games: return
-    
-    current_num = get_game_num()
-    
-    # 🔥 1. ОЧИСТКА СТАРЫХ ДАННЫХ (каждые 100 циклов)
-    if stats["total_seen"] % 100 == 0:
-        old_keys = [k for k in list(games_by_num.keys()) if k < normalize(current_num - 20)]
-        for k in old_keys:
-            del games_by_num[k]
-        # Очищаем старые проверенные номера (оставляем только последние 50)
-        if len(checked_game_nums) > 50:
-            checked_game_nums.clear()
-        print(f" Очистка памяти. Текущий номер: {current_num}")
-    
-    # 2. СБОР НОВЫХ ID
-    new_ids_count = 0
-    for g in games:
-        gid = g.get("I")
-        if not gid or gid in logged_ids: continue
-        logged_ids.add(gid)
-        stats["total_seen"] += 1
-        new_ids_count += 1
-        if gid not in games_by_num[current_num]:
-            games_by_num[current_num].append(gid)
-    
-    if new_ids_count > 0:
-        print(f" Найдено {new_ids_count} новых ID. Всего в памяти: {len(games_by_num)} игр")
-
-    #  3. СОЗДАНИЕ ПРОГНОЗА (если нет активного и есть 3+ ID)
-    if not active_pred["active"]:
-        for gnum, ids in list(games_by_num.items()):
-            if gnum in predictions_made_for_num or len(ids) < 3: continue
-            
-            # Анализ паттерна
-            suits_found = set(int(i) % 4 for i in ids)
-            n_suits = len(suits_found)
-            patterns["total_analyzed"] += 1
-            if n_suits == 4: patterns["4_suits"] += 1
-            elif n_suits == 3: patterns["3_suits"] += 1
-            elif n_suits == 2: patterns["2_suits"] += 1
-            else: patterns["1_suit"] += 1
-
-            # Выбор оптимального ID
-            optimal_id = ids[0]
-            optimal_suit = int(ids[0]) % 4
-            for suit_code in [0, 1, 2, 3]:
-                if any(int(i) % 4 == suit_code for i in ids):
-                    optimal_id = next(i for i in ids if int(i) % 4 == suit_code)
-                    optimal_suit = suit_code
-                    break
-
-            target_num = normalize(gnum + 3)
-            predictions_made_for_num.add(gnum)
-            
-            pattern_text = "Все 4 масти" if n_suits == 4 else f"{n_suits} масти"
-            msg = (
-                f"🎯 <b>НОВЫЙ ПРОГНОЗ</b>\n"
-                f"📌 Триггер: #{gnum}\n"
-                f"🃏 Масть: {SUITS[optimal_suit]['symbol']} {SUITS[optimal_suit]['name']}\n"
-                f"🎯 Цель: #{target_num}\n"
-                f"📊 Паттерн: {pattern_text}\n"
-                f" <i>Ожидание...</i>"
-            )
-            sent = bot.send_message(STATS_CHANNEL_ID, msg, parse_mode="HTML")
-            
-            stats["predictions"] += 1
-            active_pred.update({
-                "active": True, "msg_id": sent.message_id, "trigger_num": gnum,
-                "target_num": target_num, "suit_code": optimal_suit, "attempts": 0
-            })
-            print(f"🚀 ПРОГНОЗ СОЗДАН: #{gnum} -> #{target_num} ({SUITS[optimal_suit]['symbol']}) | ID: {len(ids)} шт")
-            return  # 🔥 ВАЖНО: создаем только 1 прогноз за раз
-
-    # 🔥 4. ПРОВЕРКА РЕЗУЛЬТАТОВ (если есть активный прогноз)
-    if active_pred["active"]:
-        target = active_pred["target_num"]
-        check_range = [normalize(target + i) for i in range(3)]
         
-        for gnum in check_range:
-            if gnum in checked_game_nums: continue
-            
-            ids_to_check = games_by_num.get(gnum, [])
-            if not ids_to_check: continue
-            
-            print(f" Проверка игры #{gnum} (попытка {active_pred['attempts']+1}/3)")
-            active_pred["attempts"] += 1
-            checked_game_nums.add(gnum)
-            
-            results_text = f"📝 <b>Игра #{gnum} (все потоки):</b>\n"
-            is_hit = False
-            all_finished = True
-            
-            for gid in ids_to_check:
-                data = fetch_details(gid)
-                if not data: 
-                    results_text += f"🆔 <code>{gid[-6:]}</code>: ⚠️ Ошибка\n"
-                    continue
-                    
-                cards, is_finished = parse_cards(data)
-                
-                if not is_finished:
-                    all_finished = False
-                    results_text += f"🆔 <code>{gid[-6:]}</code>: ⏳ Идет\n"
-                    continue
-                
-                if cards:
-                    cards_str = " ".join([f"{c['value']}{SUITS[c['suit']]['symbol']}" for c in cards])
-                    results_text += f"🆔 <code>{gid[-6:]}</code>: {cards_str}\n"
-                    if any(c["suit"] == active_pred["suit_code"] for c in cards):
-                        is_hit = True
-                else:
-                    results_text += f"🆔 <code>{gid[-6:]}</code>: ⚠️ Пусто\n"
-            
-            # Если не все игры завершились, ждем
-            if not all_finished:
-                print(f"⏳ Игра #{gnum} еще не все потоки завершились, ждем...")
-                continue
-            
-            # Финальный результат
-            if is_hit:
-                update_pred_message(True, results_text)
-                stats["hits"] += 1
-                print(f"🎉 ПРОГНОЗ ЗАШЁЛ на #{gnum}!")
-                reset_pred()
-                return
-            elif active_pred["attempts"] >= 3:
-                update_pred_message(False, results_text + "\n<i>(3 попытки)</i>")
-                stats["misses"] += 1
-                print(f"❌ Прогноз не зашёл (3 попытки)")
-                reset_pred()
-                return
-            else:
-                print(f"⏳ Продолжаем проверку (попыток: {active_pred['attempts']}/3)")
+        return text
+    except Exception as e:
+        print(f"⚠️ Ошибка форматирования: {e}")
+        return None
 
-# --- ЗАПУСК ---
+def send_to_channel(text):
+    """Отправляет сообщение в канал"""
+    try:
+        bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+        print("✅ Сообщение отправлено")
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка отправки: {e}")
+        return False
+
+def send_raw_json(games):
+    """Отправляет сырой JSON (первые 5 игр для примера)"""
+    try:
+        # Отправляем только первые 3 игры чтобы не спамить
+        preview = games[:3] if len(games) > 3 else games
+        
+        json_str = json.dumps(preview, indent=2, ensure_ascii=False)
+        
+        # Если JSON слишком большой, отправляем как файл
+        if len(json_str) > 4000:
+            with open("games_data.json", "w", encoding="utf-8") as f:
+                json.dump(games, f, indent=2, ensure_ascii=False)
+            
+            with open("games_data.json", "rb") as f:
+                bot.send_document(CHANNEL_ID, f, caption="📄 Полные данные JSON (файл)")
+            print("✅ JSON отправлен как файл")
+        else:
+            text = f"<pre>{json_str}</pre>"
+            bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+            print("✅ JSON отправлен")
+    except Exception as e:
+        print(f"❌ Ошибка отправки JSON: {e}")
+
 def main():
-    print("🚀 ЗАПУСК БОТА (ОПТИМИЗИРОВАННЫЙ)")
+    print("🚀 ЗАПУСК БОТА-МОНИТОРА API")
     print("=" * 60)
-    send_to_channel("🟢 <b>Бот запущен (оптимизированная версия)</b>")
     
+    # Отправляем приветствие
+    send_to_channel("🟢 <b>Бот мониторинга API запущен</b>\n\nОтслеживаю виртуальную Баккару...")
+    
+    last_send_time = 0
     cycle = 0
+    
     while True:
         try:
-            process_games()
             cycle += 1
+            print(f"\n🔄 Цикл #{cycle} - Запрос к API...")
             
-            #  Статистика раз в ЧАС (3600 секунд)
-            if time.time() - last_summary_time >= 3600:
-                send_summary()
+            games = fetch_data()
             
-            if cycle % 20 == 0:
-                print(f"⏱ Цикл {cycle} | Активен: {active_pred['active']} | Прогнозов: {stats['predictions']}")
+            if not games:
+                print("⚠️ Нет данных от API")
+                time.sleep(10)
+                continue
             
-            time.sleep(3)
+            print(f"📊 Получено {len(games)} игр")
+            
+            # Отправляем сырой JSON при первом запуске и каждые 10 циклов
+            if cycle == 1 or cycle % 10 == 0:
+                send_raw_json(games)
+            
+            # Отправляем информацию о новых играх
+            current_time = time.time()
+            new_games_count = 0
+            
+            for game in games:
+                game_id = game.get("I")
+                if not game_id or game_id in sent_games:
+                    continue
+                
+                # Новая игра!
+                sent_games.add(game_id)
+                new_games_count += 1
+                
+                formatted_text = format_game_info(game)
+                if formatted_text:
+                    send_to_channel(formatted_text)
+            
+            if new_games_count > 0:
+                print(f"✅ Отправлено {new_games_count} новых игр")
+            
+            # Очищаем старые ID (оставляем только последние 100)
+            if len(sent_games) > 100:
+                sent_games.clear()
+                print("🗑️ Очищена история игр")
+            
+            # Ждем перед следующим запросом
+            time.sleep(15)
+            
         except Exception as e:
-            print(f"️ Ошибка: {e}")
+            print(f"⚠️ Ошибка в главном цикле: {e}")
             import traceback
             traceback.print_exc()
-            time.sleep(5)
+            time.sleep(30)
 
 if __name__ == "__main__":
     main()
