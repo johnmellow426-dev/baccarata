@@ -51,10 +51,7 @@ BASE_PREDICTION_STRATEGY = {
 }
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ОБУЧЕНИЯ И СОСТОЯНИЯ ---
-# Обучение карт на основе суммы цифр ID (id_sum % 13 + 1)
-id_card_stats = defaultdict(lambda: defaultdict(int))  # id_mod -> {predicted_card: count}
-
-# ЕДИНСТВЕННЫЙ АКТИВНЫЙ ПРОГНОЗ НА МАСТЬ В КАНАЛЕ
+id_card_stats = defaultdict(lambda: defaultdict(int))
 active_suit_prediction = {
     "active": False,
     "message_id": None,
@@ -70,6 +67,9 @@ processed_game_ids = set()
 logged_game_ids = set()
 state_lock = threading.Lock()
 
+# Добавляем счетчик циклов для диагностики
+cycle_counter = 0
+
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И АНАЛИЗАТОР ID ---
 
 def analyze_game_id(game_id):
@@ -77,10 +77,7 @@ def analyze_game_id(game_id):
     gid_int = int(game_id)
     digits_sum = sum(int(d) for d in str(game_id) if d.isdigit())
     
-    # 1. Определение масти игроку по ID
     player_suit_code = gid_int % 4
-    
-    # 2. Определение потенциального достоинства карты по модулю суммы цифр
     card_by_id = (digits_sum % 13) + 1
     
     return {
@@ -124,7 +121,7 @@ def parse_cards_from_api(cards_json):
                     "full": format_card_full(value, suit)
                 })
         return parsed
-    except Exception:
+    except Exception as e:
         return []
 
 def get_all_game_cards(game_data):
@@ -154,8 +151,11 @@ def fetch_game_details(game_id):
         url = DETAIL_URL_TEMPLATE.format(game_id=game_id)
         resp = requests.get(url, headers=HEADERS, timeout=4, proxies=NO_PROXY)
         if resp.status_code == 200:
-            return resp.json().get("Value", {})
-        return None
+            data = resp.json()
+            return data.get("Value", {})
+        else:
+            print(f"⚠️ Ошибка HTTP {resp.status_code} для игры {game_id}")
+            return None
     except Exception as e:
         print(f"⚠️ Ошибка сети при запросе игры {game_id}: {e}")
         return None
@@ -164,16 +164,18 @@ def get_active_games():
     try:
         resp = requests.get(LIST_URL, headers=HEADERS, timeout=4, proxies=NO_PROXY)
         if resp.status_code == 200:
-            return resp.json().get("Value", [])
-        return []
+            data = resp.json()
+            games = data.get("Value", [])
+            print(f"📊 Загружено {len(games)} игр из API")  # Диагностика
+            return games
+        else:
+            print(f"⚠️ Ошибка HTTP {resp.status_code} при загрузке списка")
+            return []
     except Exception as e:
         print(f"⚠️ Ошибка загрузки списка Live: {e}")
         return []
 
-# --- ИЗУЧЕНИЕ ЗНАЧЕНИЙ ПО ID ---
-
 def update_id_statistics(game_id, actual_cards):
-    """Обучение связи суммы цифр ID с выпадающими картами."""
     id_analysis = analyze_game_id(game_id)
     id_mod = id_analysis["card_by_id"]
     
@@ -183,7 +185,6 @@ def update_id_statistics(game_id, actual_cards):
             id_card_stats[id_mod][val] += 1
 
 def predict_card_by_id(game_id):
-    """Прогноз карты на основе ID."""
     id_analysis = analyze_game_id(game_id)
     id_mod = id_analysis["card_by_id"]
     
@@ -193,8 +194,6 @@ def predict_card_by_id(game_id):
             return best_card, "обучение по ID"
     
     return id_mod, "гипотеза по ID"
-
-# --- ТЕЛЕГРАМ УВЕДОМЛЕНИЯ ПРОГНОЗА МАСТИ ---
 
 def send_suit_prediction_telegram():
     pred = active_suit_prediction
@@ -261,13 +260,19 @@ def reset_active_suit_prediction():
         active_suit_prediction["checked_games_count"] = 0
         active_suit_prediction["checked_game_ids"] = set()
 
-# --- ОСНОВНАЯ ЛОГИКА ---
-
 def process_live_games():
+    global cycle_counter
+    cycle_counter += 1
+    
+    print(f"\n🔄 Цикл #{cycle_counter} - Запрос к API...")
+    
     games = get_active_games()
     if not games:
+        print("⚠️ Нет активных игр или ошибка загрузки")
         return
 
+    processed_any = False
+    
     for g in games:
         gid = g.get("I")
         if not gid:
@@ -277,60 +282,60 @@ def process_live_games():
         if not game_data:
             continue
 
+        processed_any = True
         cards_info = get_all_game_cards(game_data)
         is_finished = game_data.get("SC", {}).get("CPS") == "Игра завершена"
         game_num = get_utc_game_number()
         all_cards = cards_info.get("all", [])
 
-        # Анализ ID текущей игры
         id_analysis = analyze_game_id(gid)
 
         with state_lock:
-            # 1. ЛОГИРОВАНИЕ И АНАЛИЗ В КОНСОЛЬ
+            # 1. ЛОГИРОВАНИЕ
             if gid not in logged_game_ids:
                 logged_game_ids.add(gid)
                 pred_card, model_type = predict_card_by_id(gid)
                 print(
-                    f"🆕 Начата игра #{game_num} (ID: {gid}) | "
-                    f"Прогноз масти ID: {id_analysis['player_suit']['symbol']} {id_analysis['player_suit']['name']} | "
-                    f"Прогноз карты по ID: {format_card(pred_card)} ({model_type})"
+                    f"🆕 Игра #{game_num} (ID: {gid}) | "
+                    f"Масть по ID: {id_analysis['player_suit']['symbol']} {id_analysis['player_suit']['name']} | "
+                    f"Карта: {format_card(pred_card)} ({model_type})"
                 )
 
-            # 2. ФОНОВОЕ ОБУЧЕНИЕ ПО ID
+            # 2. ОБУЧЕНИЕ
             if is_finished and gid not in processed_game_ids:
                 processed_game_ids.add(gid)
                 update_id_statistics(gid, all_cards)
+                print(f"📚 Обучили игру #{game_num} (ID: {gid})")
 
-            # 3. ПРОВЕРКА АКТИВНОГО ПРОГНОЗА МАСТИ
+            # 3. ПРОВЕРКА ПРОГНОЗА
             if active_suit_prediction["active"]:
                 target_num = active_suit_prediction["target_game_num"]
                 diff = normalize_game_num(game_num - target_num)
 
-                # Проверяем 3 игры подряд (целевая, +1, +2)
                 if 0 <= diff <= 2:
                     if gid not in active_suit_prediction["checked_game_ids"]:
                         active_suit_prediction["checked_game_ids"].add(gid)
                         active_suit_prediction["checked_games_count"] += 1
 
-                        # Ищем совпадение нужной масти в картах
                         target_suit = active_suit_prediction["predicted_suit_code"]
                         hit_card = next((c for c in all_cards if c["suit"] == target_suit), None)
 
                         if hit_card:
                             res_str = f"✅ ЗАШЕЛ на {diff + 1}-й игре!\n🃏 Выпала карта: **{hit_card['full']}**"
                             update_suit_prediction_telegram(res_str, True)
-                            print(f"🎯 Прогноз масти #{target_num} ЗАШЕЛ! Канал свободен.")
+                            print(f"🎯 Прогноз масти #{target_num} ЗАШЕЛ!")
                             reset_active_suit_prediction()
 
                         elif active_suit_prediction["checked_games_count"] >= 3 or (is_finished and diff == 2):
                             actual_str = ", ".join([c["full"] for c in all_cards[:4]]) if all_cards else "Карты не показаны"
                             res_str = f"❌ НЕ СБЫЛСЯ (3 попытки окончены)\n🃏 Карты: {actual_str}"
                             update_suit_prediction_telegram(res_str, False)
-                            print(f"❌ Прогноз масти #{target_num} НЕ зашел. Канал свободен.")
+                            print(f"❌ Прогноз масти #{target_num} НЕ зашел")
                             reset_active_suit_prediction()
 
-            # 4. СОЗДАНИЕ НОВОГО ПРОГНОЗА (Только если активных прогнозов НЕТ)
-            elif not active_suit_prediction["active"] and gid not in processed_game_ids:
+            # 4. СОЗДАНИЕ НОВОГО ПРОГНОЗА
+            # УБРАЛИ проверку gid not in processed_game_ids, которая блокировала создание прогнозов
+            elif not active_suit_prediction["active"]:
                 target_num = normalize_game_num(game_num + 3)
 
                 active_suit_prediction["active"] = True
@@ -342,6 +347,7 @@ def process_live_games():
                 active_suit_prediction["checked_game_ids"] = set()
 
                 send_suit_prediction_telegram()
+                print(f"🎯 Создан прогноз на игру #{target_num}")
 
 def main():
     print("\n🚀 ЗАПУСК МОНИТОРИНГА (РЕЖИМ: 1 АКТИВНЫЙ ПРОГНОЗ МАСТИ В КАНАЛЕ + ИЗУЧЕНИЕ ID)")
@@ -353,6 +359,8 @@ def main():
             time.sleep(2.5)
         except Exception as e:
             print(f"⚠️ Ошибка в главном цикле: {e}")
+            import traceback
+            traceback.print_exc()
             time.sleep(5)
 
 if __name__ == "__main__":
