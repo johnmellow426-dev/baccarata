@@ -16,9 +16,9 @@ STATS_SOURCE_CHANNEL_ID= os.getenv("STATS_SOURCE_CHANNEL_ID") # Statistika bacca
 API_URL = "https://melbet-2814.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"}
 
-SERIES_LEN   = 2     # одинаковых mod4 подряд = сигнал (2 чаще / 4 реже)
+SERIES_LEN   = 3     # одинаковых mod4 подряд = сигнал (2 чаще / 4 реже)
 CHECK_RANGE  = 2     # проверка N и N+1
-PRED_TIMEOUT = 420   # таймаут ожидания #R, сек
+PRED_TIMEOUT = 450   # таймаут ожидания #R, сек
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 lock = threading.Lock()
