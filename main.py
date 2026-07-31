@@ -133,7 +133,7 @@ def fetch_data():
 def format_game_info(game):
     try:
         return (
-            f" ИГРА #N{game.get('I','N/A')}   Display ID: {game.get('DI','N/A')}\n"
+            f"🎮 ИГРА #N{game.get('I','N/A')}   Display ID: {game.get('DI','N/A')}\n"
             f"──────────────────────────────\n")
     except Exception as e:
         print(f"⚠️ fmt: {e}"); return None
@@ -224,9 +224,9 @@ def process_stats_message(msg):
                 if has_nat:
                     # 🔥 Определяем позицию: 0️⃣ или 1️
                     if num == pred["first_n"]:
-                        pos = "0️⃣"
+                        pos = "0️⃣0️⃣"
                     else:
-                        pos = "1️"
+                        pos = "0️⃣1️⃣"
                     finalize(pred, True, f"{pos} #N{num} → Натурал #R")
                     print(f"🎉 НАТУРАЛ #N{num} ({pos})")
                 elif len(pred["checked"]) >= 2:
