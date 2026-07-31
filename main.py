@@ -14,15 +14,15 @@ PREDICTION_CHANNEL_ID   = os.getenv("PREDICTION_CHANNEL_ID")
 MASTI_CHANNEL_ID        = os.getenv("MASTI_CHANNEL_ID")
 STATS_SOURCE_CHANNEL_ID = int(os.getenv("STATS_SOURCE_CHANNEL_ID", "0"))
 
-SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,3,4,5").split(","))
+SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "4,5").split(","))
 PRED_TIMEOUT   = int(os.getenv("PRED_TIMEOUT", 720))
 MAX_ACTIVE     = int(os.getenv("MAX_ACTIVE", 10))
 
 # Параметры плотного потока генератора (delta ID)
-MIN_DELTA_ID   = int(os.getenv("MIN_DELTA_ID", 100))
+MIN_DELTA_ID   = int(os.getenv("MIN_DELTA_ID", 110))
 MAX_DELTA_ID   = int(os.getenv("MAX_DELTA_ID", 160))
 
-# Сомнительные окончания game_id, которые нужно пропускать
+# Сомнительные окончания game_id, которые пропускаем
 FORBIDDEN_ENDINGS = ("62", "73", "51", "84")
 
 API_URL = "https://melbet-2814.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
@@ -30,6 +30,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 
 ARROW_CHAR = '\U0001F448'
 
+# Карта мастей: 1: ♠️, 2: ♣️, 3: ♦️, 4: ♥️
 SUITS_MAP = {
     1: {"name": "Пики", "symbol": "♠️"},
     2: {"name": "Трефы", "symbol": "♣️"},
@@ -62,17 +63,25 @@ def is_final_result(text):
     return True
 
 def get_suit_by_id(game_id):
+    """
+    Расчет масти по последней цифре game_id:
+    1, 5, 9 -> ♠️ (Пики)
+    2, 6    -> ♣️ (Трефы)
+    3, 7    -> ♦️ (Бубны)
+    4, 8, 0 -> ♥️ (Червы)
+    """
     last_digit = int(str(game_id)[-1])
     if last_digit in (1, 5, 9):
-        return 1  # ♠️ Пики
+        return 1
     elif last_digit in (2, 6):
-        return 2  # ♣️ Трефы
+        return 2
     elif last_digit in (3, 7):
-        return 3  # ♦️ Бубны
-    else: # 4, 8, 0
-        return 4  # ♥️ Червы
+        return 3
+    else:
+        return 4
 
 def parse_player_suits(text):
+    """Парсит масти с руки Игрока (первые скобки в сообщении)"""
     groups = re.findall(r'\(([^)]*)\)', text or "")
     if not groups: 
         return set()
@@ -129,6 +138,7 @@ def parse_stats(text):
     return int(m.group(1)), bool(re.search(r'#R\b', text))
 
 def finalize(pred, success, detail):
+    """Финализация прогноза Натуралов с гарантированной очисткой"""
     try:
         mark = "✅" if success else "❌"
         bot.edit_message_text(
@@ -136,31 +146,34 @@ def finalize(pred, success, detail):
             text=(f"🎯 Игра #N{pred['first_n']}\nВозможна Раздача (серия потока)\n"
                   f"проверка {pred['label']}\n{mark} {detail}"))
     except ApiTelegramException as e:
-        if "message is not modified" not in e.description and "message to edit not found" not in e.description:
-            print(f"⚠️ edit err: {e}")
+        print(f"⚠️ edit err (сообщение удалено или не найдено): {e.description}")
     except Exception as e: 
         print(f"⚠️ edit: {e}")
-        
-    with lock:
-        if pred in active_preds: 
-            active_preds.remove(pred)
+    finally:
+        with lock:
+            if pred in active_preds: 
+                active_preds.remove(pred)
 
 def finalize_mast(pred_key, result_text):
-    """Финализация прогноза масти и открытие очереди для следующего"""
+    """Финализация прогноза масти и ГАРАНТИРОВАННЫЙ сброс очереди"""
     global can_predict_masti
+    pred = None
+    
     with lock:
-        if pred_key not in mast_preds: return
-        pred = mast_preds[pred_key]
-        del mast_preds[pred_key]
-        # Разрешаем создавать следующий прогноз после финализации текущего
+        if pred_key in mast_preds:
+            pred = mast_preds[pred_key]
+            del mast_preds[pred_key]
+        # В ЛЮБОМ СЛУЧАЕ освобождаем очередь для следующих прогнозов!
         can_predict_masti = True
         
+    if not pred:
+        return
+
     try:
         text = f"🎯 Игра #N{pred['first_n']}\nИгрок {pred['suit_symbol']} {result_text}".strip()
         bot.edit_message_text(chat_id=MASTI_CHANNEL_ID, message_id=pred["msg_id"], text=text)
     except ApiTelegramException as e:
-        if "message is not modified" not in e.description and "message to edit not found" not in e.description:
-            print(f"⚠️ edit mast err: {e}")
+        print(f"⚠️ edit mast err (сообщение удалено): {e.description}")
     except Exception as e: 
         print(f"⚠️ edit mast: {e}")
 
@@ -217,23 +230,23 @@ def flush_series(series):
 
 # ==================== СОЗДАНИЕ ПРОГНОЗОВ МАСТЕЙ ====================
 def create_mast_prediction(game_id, display_id):
-    """Создаёт прогноз с соблюдением очереди и фильтром сомнительных ID"""
+    """Создаёт прогноз мастей с фильтром и строгой очередью"""
     global can_predict_masti
     
-    # 1. Проверка очереди (прогноз каждые 3 игры — ждём закрытия предыдущего)
+    # 1. Проверяем очередь (не даём новый прогноз, пока старый висит)
     if not can_predict_masti:
         return
 
-    # 2. Фильтр сомнительных окончаний game_id (62, 73, 51, 84)
+    # 2. Фильтр сомнительных окончаний game_id
     gid_str = str(game_id)
     if gid_str.endswith(FORBIDDEN_ENDINGS):
-        print(f"🚫 Пропуск сомнительного ID: {game_id} (оканчивается на {gid_str[-2:]})")
+        print(f"🚫 Пропуск сомнительного ID: {game_id} (окончание {gid_str[-2:]})")
         return
 
     with lock:
         if display_id in mast_preds: 
             return
-        # Блокируем создание новых прогнозов, пока этот не закроется
+        # Блокируем создание новых прогнозов до закрытия текущего
         can_predict_masti = False
     
     suit_code = get_suit_by_id(game_id)
@@ -253,9 +266,9 @@ def create_mast_prediction(game_id, display_id):
                 "checked": set(),
                 "created_at": time.time()
             }
-        print(f"🎯 МАСТЬ #N{display_id} → {suit_info['symbol']} (ID {game_id}) | Очередь заблокирована до закрытия")
+        print(f"🎯 МАСТЬ #N{display_id} → {suit_info['symbol']} (ID {game_id}) | Очередь закрыта")
     else:
-        # Если не удалось отправить, возвращаем возможность дать прогноз
+        # При ошибке отправки возвращаем возможность прогнозировать
         with lock:
             can_predict_masti = True
 
@@ -278,7 +291,7 @@ def process_stats_message(msg):
     processed_stats_nums.add(num)
     print(f"🔎 ФИНАЛ #N{num} | #R={has_nat}")
 
-    # 1. Проверка прогнозов натуралов
+    # 1. Проверка прогнозов Натуралов
     with lock:
         preds_to_check = list(active_preds)
         
@@ -310,7 +323,7 @@ def process_stats_message(msg):
                     print(f"🎉 МАСТЬ УГАДАНА #N{num} (шаг {pos}) | Рука: {player_suits}")
                 else:
                     if len(pred["checked"]) >= 2:
-                        # Финализация проигрыша с красным крестом ❌
+                        # Финализация проигрыша меткой ❌
                         finalize_mast(pred_key, "❌")
                         print(f"❌ МАСТЬ НЕ УГАДАНА (#N{pred['first_n']}/#N{pred['second_n']})")
                     else:
@@ -334,7 +347,7 @@ def api_cycle():
     games = fetch_data()
     if not games: return
 
-    # Таймауты активных прогнозов
+    # Проверка таймаутов
     with lock:
         for pred in list(active_preds):
             if time.time() - pred["created_at"] > PRED_TIMEOUT:
