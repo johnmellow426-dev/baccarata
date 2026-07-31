@@ -135,9 +135,7 @@ def format_game_info(game):
     try:
         return (
             f"🎮 ИГРА #N{game.get('I','N/A')}   Display ID: {game.get('DI','N/A')}\n"
-            f"──────────────────────────────\n📊 Информация:\n  Спорт: {game.get('SN','N/A')}\n"
-            f"  Системные данные:\n  Event Counter: {game.get('EC','N/A')}\n"
-            f"  League ID: {game.get('LI','N/A')}\n  Sport ID: {game.get('SI','N/A')}")
+            f"──────────────────────────────\n")
     except Exception as e:
         print(f"⚠️ fmt: {e}"); return None
 
