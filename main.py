@@ -23,11 +23,7 @@ DB_DUMP_MIN    = int(os.getenv("DB_DUMP_MIN", 60))
 
 API_URL = "https://melbet-2814.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"}
-SUITS_RE = re.compile(r'[♥♦♣]')
-
-# 🔥 Базовый символ стрелки "указывающий назад" (U+1F448).
-# Находится как подстрока во ВСЕХ вариантах: 👈, 👈🏽, 👈🏾, 👈🏻 и т.д.
-ARROW_CHAR = '\U0001F448'
+SUITS_RE = re.compile(r'[♠♥♦♣]')
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 lock = threading.Lock()
@@ -35,7 +31,7 @@ lock = threading.Lock()
 # ==================== СОСТОЯНИЕ ====================
 sent_games   = set()
 active_preds = []
-current_series = {"pair": None, "dis": [], "published": False}
+current_series = {"pair": None, "dis": [], "published": set()}
 processed_stats_nums = set()
 
 totals_db = {}
@@ -47,9 +43,9 @@ def normalize(n): return ((n - 1) % 1440) + 1
 def pair_key(p): return f"{p:02d}"
 
 def is_final_result(text):
-    """True только для финального результата (нет стрелки = финал)"""
+    """True для финального результата (нет стрелки = не промежуточный)"""
     if not text: return False
-    if ARROW_CHAR in text: return False   # любая стрелка (базовая + skin tone) = промежуточный
+    if '👈' in text: return False  # любая стрелка (базовая + модификаторы) = промежуточный
     return True
 
 # ==================== БД ====================
@@ -60,11 +56,11 @@ def load_db():
             data = json.load(f)
         totals_db  = data.get("totals", {})
         di_to_pair = {int(k): v for k, v in data.get("di_to_pair", {}).items()}
-        print(f" БД загружена: пар={len(totals_db)}, маппингов={len(di_to_pair)}")
+        print(f"💾 БД загружена: пар={len(totals_db)}, маппингов={len(di_to_pair)}")
     except FileNotFoundError:
         print("💾 БД не найдена, начинаем с нуля")
     except Exception as e:
-        print(f"️ load_db: {e}")
+        print(f"⚠️ load_db: {e}")
 
 def save_db():
     try:
@@ -139,7 +135,9 @@ def format_game_info(game):
     try:
         return (
             f"🎮 ИГРА #N{game.get('I','N/A')}   Display ID: {game.get('DI','N/A')}\n"
-            f"──────────────────────────────\n")
+            f"──────────────────────────────\n📊 Информация:\n  Спорт: {game.get('SN','N/A')}\n"
+            f"  Системные данные:\n  Event Counter: {game.get('EC','N/A')}\n"
+            f"  League ID: {game.get('LI','N/A')}\n  Sport ID: {game.get('SI','N/A')}")
     except Exception as e:
         print(f"⚠️ fmt: {e}"); return None
 
@@ -162,12 +160,12 @@ def finalize(pred, success, detail):
         mark = "✅" if success else "❌"
         bot.edit_message_text(
             chat_id=PREDICTION_CHANNEL_ID, message_id=pred["msg_id"],
-            text=(f"🎯 Игра #N{pred['first_n']}\nВозможна Раздача (серия потока)\n"
+            text=(f" Игра #N{pred['first_n']}\nВозможна Раздача (серия потока)\n"
                   f"проверка {pred['label']}\n{mark} {detail}"))
-    except Exception as e: print(f"️ edit: {e}")
+    except Exception as e: print(f"⚠️ edit: {e}")
     if pred in active_preds: active_preds.remove(pred)
 
-def _make_pred(first_n, second_n, label):
+def _make_pred(first_n, label, targets_norm):
     with lock:
         if len(active_preds) >= MAX_ACTIVE:
             print(f"⛔ лимит {MAX_ACTIVE}, пропуск {label}"); return False
@@ -176,56 +174,51 @@ def _make_pred(first_n, second_n, label):
     sent = send_prediction(text)
     if not sent: return False
     with lock:
-        active_preds.append({"msg_id": sent.message_id, "first_n": first_n,
-                             "second_n": second_n, "checked": set(),
-                             "created_at": time.time(), "label": label})
+        active_preds.append({"msg_id": sent.message_id, "targets_norm": targets_norm,
+                             "checked": set(), "created_at": time.time(),
+                             "first_n": first_n, "label": label})
     return True
 
-def flush_series(series):
-    """Логика выбора номеров в зависимости от длины серии"""
-    if series["published"]: return
-    dis = series["dis"]
-    length = len(dis)
-    if length < 2: return
+def publish_pair(a, b, published):
+    label = f"#N{int(a)}/#N{int(b)}"
+    if _make_pred(int(a), label, {normalize(int(a)), normalize(int(b))}):
+        published.add(a); published.add(b)
+        print(f"🚀 ПАРА {label} (len={len(current_series['dis'])})")
 
-    if length == 2:
-        first_n = int(dis[-1])
-        second_n = normalize(first_n + 1)
-    elif length in (3, 4):
-        first_n = int(dis[1])
-        second_n = int(dis[2])
-    elif length == 5:
-        first_n = int(dis[2])
-        second_n = int(dis[3])
-    else:
-        first_n = int(dis[-2])
-        second_n = int(dis[-1])
+def publish_single(a, published):
+    label = f"#N{int(a)}"
+    if _make_pred(int(a), label, {normalize(int(a))}):
+        published.add(a)
+        print(f"🚀 ОДИНОЧКА {label}")
 
-    label = f"#N{first_n}/#N{second_n}"
-
-    if _make_pred(first_n, second_n, label):
-        series["published"] = True
-        print(f"🚀 ПРОГНОЗ {label} (серия len={length})")
+def flush_series(series, tail):
+    dis, published = series["dis"], series["published"]
+    i = 0
+    while i + 1 < len(dis):
+        if dis[i + 1] not in published:
+            publish_pair(dis[i], dis[i + 1], published)
+        i += 2
+    if tail and len(dis) % 2 == 1 and dis[-1] not in published:
+        publish_single(dis[-1], published)
 
 # ==================== ОБРАБОТЧИКИ TELEGRAM ====================
 def process_stats_message(msg):
+    """Общая логика для новых и отредактированных постов"""
     if msg.chat.id != STATS_SOURCE_CHANNEL_ID: return
     parsed = parse_stats(msg.text)
     if not parsed: return
     num, has_nat = parsed
 
+    # Защита от дублей
     if num in processed_stats_nums:
         return
 
-    # 🔥 Диагностика: точная причина пропуска
+    # Фильтр: только финальный результат
     if not is_final_result(msg.text):
-        # Проверяем, есть ли стрелка (любой вариант)
-        has_arrow = ARROW_CHAR in msg.text
-        # Проверяем, есть ли ✅
-        has_check = '✅' in msg.text
-        print(f"⏳ промежуточный #N{num} | стрелка={has_arrow} | ✅={has_check} | текст: {msg.text[:100]!r}")
+        print(f"⏳ промежуточный апдейт #N{num}, пропускаем")
         return
 
+    # Запись в БД
     pair = di_to_pair.get(num)
     outcome = parse_totals(msg.text)
     print(f"🔎 ФИНАЛ #N{num} | пара={pair} | тотал={outcome} | #R={has_nat}")
@@ -238,17 +231,17 @@ def process_stats_message(msg):
     elif outcome is None:
         print(f"⚠️ DB: не удалось распарсить тотал для #N{num}")
 
+    # Проверка прогнозов
     with lock:
         for pred in list(active_preds):
-            if num in {pred["first_n"], pred["second_n"]} and num not in pred["checked"]:
+            if num in pred["targets_norm"] and num not in pred["checked"]:
                 pred["checked"].add(num)
                 if has_nat:
-                    pos = "0️⃣" if num == pred["first_n"] else "1️⃣"
-                    finalize(pred, True, f"{pos} #N{num} → Натурал #R")
-                    print(f"🎉 НАТУРАЛ #N{num} ({pos})")
-                elif len(pred["checked"]) >= 2:
-                    finalize(pred, False, "❌ не зашло")
-                    print(f" нет #R в {pred['label']}")
+                    finalize(pred, True, f"#N{num} → Натурал #R")
+                    print(f" НАТУРАЛ #N{num}")
+                elif len(pred["checked"]) >= len(pred["targets_norm"]):
+                    finalize(pred, False, f"в {pred['label']} нет #R")
+                    print(f"❌ нет #R {pred['label']}")
 
 @bot.channel_post_handler()
 def on_stats(msg):
@@ -257,7 +250,7 @@ def on_stats(msg):
 
 @bot.edited_channel_post_handler()
 def on_stats_edited(msg):
-    print(f"✏️ EDITED POST chat.id={msg.chat.id} | {(msg.text or '')[:80]!r}")
+    print(f"️ EDITED POST chat.id={msg.chat.id} | {(msg.text or '')[:80]!r}")
     process_stats_message(msg)
 
 @bot.message_handler(commands=["db"])
@@ -278,7 +271,7 @@ def api_cycle():
     with lock:
         for pred in list(active_preds):
             if time.time() - pred["created_at"] > PRED_TIMEOUT:
-                finalize(pred, False, "⏰ таймаут ожидания #R")
+                finalize(pred, False, " таймаут ожидания #R")
 
     new_games = []
     for game in games:
@@ -299,11 +292,11 @@ def api_cycle():
         if current_series["pair"] is not None and pair == (current_series["pair"] + 1) % 100:
             current_series["dis"].append(di)
         else:
-            current_series = {"pair": pair, "dis": [di], "published": False}
+            current_series = {"pair": pair, "dis": [di], "published": set()}
         current_series["pair"] = pair
 
-        if len(current_series["dis"]) in SERIES_TRIGGERS and not current_series["published"]:
-            flush_series(current_series)
+        if len(current_series["dis"]) in SERIES_TRIGGERS:
+            flush_series(current_series, tail=True)
 
     if new_games:
         print(f"✅ Новых: {len(new_games)} | серия пара={current_series['pair']} len={len(current_series['dis'])}")
@@ -316,7 +309,7 @@ def api_cycle():
 def main():
     load_db()
     print(f"🚀 ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | triggers={sorted(SERIES_TRIGGERS)} | db={DB_PATH}")
-    send_to_channel(f"🟢 <b>Бот запущен</b> | триггеры серии: {sorted(SERIES_TRIGGERS)}")
+    send_to_channel(f" <b>Бот запущен</b> | триггеры серии: {sorted(SERIES_TRIGGERS)}")
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
     while True:
         try:
