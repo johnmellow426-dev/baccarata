@@ -14,14 +14,13 @@ PREDICTION_CHANNEL_ID   = os.getenv("PREDICTION_CHANNEL_ID")
 MASTI_CHANNEL_ID        = os.getenv("MASTI_CHANNEL_ID")
 STATS_SOURCE_CHANNEL_ID = int(os.getenv("STATS_SOURCE_CHANNEL_ID", "0"))
 
-SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,3,4,5").split(","))
+SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,4,5").split(","))
 PRED_TIMEOUT   = int(os.getenv("PRED_TIMEOUT", 720))
 MAX_ACTIVE     = int(os.getenv("MAX_ACTIVE", 10))
-MAX_MAST_ACTIVE= int(os.getenv("MAX_MAST_ACTIVE", 4))  # Лимит активных прогнозов мастей
+MAX_MAST_ACTIVE= int(os.getenv("MAX_MAST_ACTIVE", 3))  # Лимит активных прогнозов мастей
 
 API_URL = "https://melbet-2814.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"}
-SUITS_RE = re.compile(r'[♠♥♦♣]')
 
 ARROW_CHAR = '\U0001F448'
 
@@ -59,11 +58,29 @@ def get_suit_by_id(game_id):
         return 3
     return last_digit % 3
 
-def parse_player_suit(text):
+def parse_player_suits(text):
+    """
+    Парсит все карты в руке Игрока (первые скобки) и возвращает 
+    множество (set) всех присутствующих мастей с учётом любых кодировок и эмодзи.
+    """
     groups = re.findall(r'\(([^)]*)\)', text or "")
-    if len(groups) < 1: return None
-    suits = SUITS_RE.findall(groups[0])
-    return suits[0] if suits else None
+    if not groups: 
+        return set()
+        
+    player_cards_text = groups[0] # Берем только карты Игрока
+    found_suits = set()
+    
+    # Проверяем все варианты написания базовых мастей в тексте карт игрока
+    if any(s in player_cards_text for s in ['♠', '♠️']): 
+        found_suits.add('♠️')
+    if any(s in player_cards_text for s in ['♣', '♣️']): 
+        found_suits.add('♣️')
+    if any(s in player_cards_text for s in ['♦', '♦️']): 
+        found_suits.add('♦️')
+    if any(s in player_cards_text for s in ['♥', '♥️']): 
+        found_suits.add('♥️')
+        
+    return found_suits
 
 # ==================== API / TG ====================
 def fetch_data():
@@ -241,21 +258,24 @@ def process_stats_message(msg):
     for pred_key, pred in masti_to_check:
         if num in {pred["first_n"], pred["second_n"]} and num not in pred["checked"]:
             pred["checked"].add(num)
-            actual_suit = parse_player_suit(msg.text)
             
-            if actual_suit:
-                if actual_suit == pred["suit_symbol"]:
+            # Получаем ВСЕ масти с руки Игрока (первые скобки)
+            player_suits = parse_player_suits(msg.text)
+            
+            if player_suits:
+                # Проверяем, есть ли нужная масть ХОТЯ БЫ на одной карте
+                if pred["suit_symbol"] in player_suits:
                     pos = "0️⃣" if num == pred["first_n"] else "1️⃣"
                     finalize_mast(pred_key, f"✅{pos}")
-                    print(f"🎉 МАСТЬ УГАДАНА #N{num} (шаг {pos})")
+                    print(f"🎉 МАСТЬ УГАДАНА #N{num} (шаг {pos}) | Масти игрока: {player_suits}")
                 else:
                     if len(pred["checked"]) >= 2:
                         finalize_mast(pred_key, "")
                         print(f"❌ МАСТЬ НЕ УГАДАНА (#N{pred['first_n']}/#N{pred['second_n']})")
                     else:
-                        print(f"⏳ Шаг 0️⃣ (#N{num}) не зашёл для масти {pred['suit_symbol']}. Ждем 1️⃣ шаг (#N{pred['second_n']})")
+                        print(f"⏳ Шаг 0️⃣ (#N{num}) не зашёл (рука: {player_suits}). Ждем 1️⃣ шаг (#N{pred['second_n']})")
             else:
-                print(f"⚠️ Не удалось распарсить масть у игрока для #N{num}")
+                print(f"⚠️ Не удалось распарсить карты игрока для #N{num}")
 
 @bot.channel_post_handler()
 def on_stats(msg):
