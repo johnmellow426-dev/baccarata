@@ -16,7 +16,7 @@ STATS_SOURCE_CHANNEL_ID = int(os.getenv("STATS_SOURCE_CHANNEL_ID"))
 API_URL = "https://melbet-2814.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"}
 
-SERIES_START = int(os.getenv("SERIES_START", 2))   # мин. длина серии для публикаций (2 = одна пара)
+SERIES_START = int(os.getenv("SERIES_START", 4))   # мин. длина серии для публикаций (2 = одна пара)
 PRED_TIMEOUT = int(os.getenv("PRED_TIMEOUT", 720))
 MAX_ACTIVE   = int(os.getenv("MAX_ACTIVE", 10))
 
