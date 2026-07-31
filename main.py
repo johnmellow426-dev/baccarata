@@ -16,14 +16,18 @@ STATS_SOURCE_CHANNEL_ID = int(os.getenv("STATS_SOURCE_CHANNEL_ID"))
 DB_CHANNEL_ID           = os.getenv("DB_CHANNEL_ID")
 
 DB_PATH        = os.getenv("DB_PATH", "/data/totals_db.json")
-SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,3,4,5").split(","))
+SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,4,5").split(","))
 PRED_TIMEOUT   = int(os.getenv("PRED_TIMEOUT", 720))
 MAX_ACTIVE     = int(os.getenv("MAX_ACTIVE", 10))
 DB_DUMP_MIN    = int(os.getenv("DB_DUMP_MIN", 60))
 
 API_URL = "https://melbet-2814.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"}
-SUITS_RE = re.compile(r'[♠♥♦♣]')
+SUITS_RE = re.compile(r'[♥♦♣]')
+
+# 🔥 Базовый символ стрелки "указывающий назад" (U+1F448).
+# Находится как подстрока во ВСЕХ вариантах: 👈, 👈🏽, 👈🏾, 👈🏻 и т.д.
+ARROW_CHAR = '\U0001F448'
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 lock = threading.Lock()
@@ -43,8 +47,9 @@ def normalize(n): return ((n - 1) % 1440) + 1
 def pair_key(p): return f"{p:02d}"
 
 def is_final_result(text):
+    """True только для финального результата (нет стрелки = финал)"""
     if not text: return False
-    if '' in text: return False
+    if ARROW_CHAR in text: return False   # любая стрелка (базовая + skin tone) = промежуточный
     return True
 
 # ==================== БД ====================
@@ -55,11 +60,11 @@ def load_db():
             data = json.load(f)
         totals_db  = data.get("totals", {})
         di_to_pair = {int(k): v for k, v in data.get("di_to_pair", {}).items()}
-        print(f"💾 БД загружена: пар={len(totals_db)}, маппингов={len(di_to_pair)}")
+        print(f" БД загружена: пар={len(totals_db)}, маппингов={len(di_to_pair)}")
     except FileNotFoundError:
-        print(" БД не найдена, начинаем с нуля")
+        print("💾 БД не найдена, начинаем с нуля")
     except Exception as e:
-        print(f"⚠️ load_db: {e}")
+        print(f"️ load_db: {e}")
 
 def save_db():
     try:
@@ -105,7 +110,7 @@ def send_dump():
     txt = build_dump()
     for i in range(0, len(txt), 4000):
         try: bot.send_message(DB_CHANNEL_ID, txt[i:i+4000], parse_mode="HTML")
-        except Exception as e: print(f"️ dump send: {e}")
+        except Exception as e: print(f"⚠️ dump send: {e}")
     send_db_file()
 
 def send_db_file(chat_id=None):
@@ -116,18 +121,18 @@ def send_db_file(chat_id=None):
             if chat_id: bot.send_message(cid, "⚠️ Файл БД ещё не создан")
             return
         with open(DB_PATH, "rb") as f:
-            bot.send_document(cid, f, caption=" Бэкап totals_db.json",
+            bot.send_document(cid, f, caption="📦 Бэкап totals_db.json",
                               visible_file_name="totals_db.json")
         print(f"📤 Файл БД отправлен в {cid}")
     except Exception as e:
-        print(f"⚠️ send_db_file: {e}")
+        print(f"️ send_db_file: {e}")
 
 # ==================== API / TG ====================
 def fetch_data():
     try:
         resp = requests.get(API_URL, headers=HEADERS, timeout=10)
         if resp.status_code == 200: return resp.json().get("Value", [])
-    except Exception as e: print(f"️ API: {e}")
+    except Exception as e: print(f"⚠️ API: {e}")
     return []
 
 def format_game_info(game):
@@ -144,7 +149,7 @@ def send_to_channel(text):
 
 def send_prediction(text):
     try: return bot.send_message(PREDICTION_CHANNEL_ID, text)
-    except Exception as e: print(f"️ pred: {e}"); return None
+    except Exception as e: print(f"⚠️ pred: {e}"); return None
 
 def parse_stats(text):
     if not text: return None
@@ -159,7 +164,7 @@ def finalize(pred, success, detail):
             chat_id=PREDICTION_CHANNEL_ID, message_id=pred["msg_id"],
             text=(f"🎯 Игра #N{pred['first_n']}\nВозможна Раздача (серия потока)\n"
                   f"проверка {pred['label']}\n{mark} {detail}"))
-    except Exception as e: print(f"⚠️ edit: {e}")
+    except Exception as e: print(f"️ edit: {e}")
     if pred in active_preds: active_preds.remove(pred)
 
 def _make_pred(first_n, second_n, label):
@@ -177,27 +182,22 @@ def _make_pred(first_n, second_n, label):
     return True
 
 def flush_series(series):
-    """ Логика выбора номеров в зависимости от длины серии"""
+    """Логика выбора номеров в зависимости от длины серии"""
     if series["published"]: return
     dis = series["dis"]
     length = len(dis)
     if length < 2: return
 
-    # Определяем индексы для прогноза
     if length == 2:
-        # последний и +1
         first_n = int(dis[-1])
         second_n = normalize(first_n + 1)
     elif length in (3, 4):
-        # 2-й и 3-й (индексы 1 и 2)
         first_n = int(dis[1])
         second_n = int(dis[2])
     elif length == 5:
-        # 3-й и 4-й (индексы 2 и 3)
         first_n = int(dis[2])
         second_n = int(dis[3])
     else:
-        # fallback для длинных серий: предпоследний и последний
         first_n = int(dis[-2])
         second_n = int(dis[-1])
 
@@ -217,13 +217,18 @@ def process_stats_message(msg):
     if num in processed_stats_nums:
         return
 
+    # 🔥 Диагностика: точная причина пропуска
     if not is_final_result(msg.text):
-        print(f"⏳ промежуточный апдейт #N{num}, пропускаем")
+        # Проверяем, есть ли стрелка (любой вариант)
+        has_arrow = ARROW_CHAR in msg.text
+        # Проверяем, есть ли ✅
+        has_check = '✅' in msg.text
+        print(f"⏳ промежуточный #N{num} | стрелка={has_arrow} | ✅={has_check} | текст: {msg.text[:100]!r}")
         return
 
     pair = di_to_pair.get(num)
     outcome = parse_totals(msg.text)
-    print(f" ФИНАЛ #N{num} | пара={pair} | тотал={outcome} | #R={has_nat}")
+    print(f"🔎 ФИНАЛ #N{num} | пара={pair} | тотал={outcome} | #R={has_nat}")
 
     if pair is not None and outcome:
         record_total(pair, outcome)
@@ -231,24 +236,19 @@ def process_stats_message(msg):
     elif pair is None:
         print(f"⚠️ DB: пара для #N{num} неизвестна")
     elif outcome is None:
-        print(f"️ DB: не удалось распарсить тотал для #N{num}")
+        print(f"⚠️ DB: не удалось распарсить тотал для #N{num}")
 
-    # Проверка прогнозов
     with lock:
         for pred in list(active_preds):
             if num in {pred["first_n"], pred["second_n"]} and num not in pred["checked"]:
                 pred["checked"].add(num)
                 if has_nat:
-                    # Определяем позицию: 0️⃣ или 1️⃣
-                    if num == pred["first_n"]:
-                        pos = "0️⃣"
-                    else:
-                        pos = "1️⃣"
+                    pos = "0️⃣" if num == pred["first_n"] else "1️⃣"
                     finalize(pred, True, f"{pos} #N{num} → Натурал #R")
                     print(f"🎉 НАТУРАЛ #N{num} ({pos})")
                 elif len(pred["checked"]) >= 2:
                     finalize(pred, False, "❌ не зашло")
-                    print(f"❌ нет #R в {pred['label']}")
+                    print(f" нет #R в {pred['label']}")
 
 @bot.channel_post_handler()
 def on_stats(msg):
@@ -315,14 +315,14 @@ def api_cycle():
 
 def main():
     load_db()
-    print(f" ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | triggers={sorted(SERIES_TRIGGERS)} | db={DB_PATH}")
+    print(f"🚀 ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | triggers={sorted(SERIES_TRIGGERS)} | db={DB_PATH}")
     send_to_channel(f"🟢 <b>Бот запущен</b> | триггеры серии: {sorted(SERIES_TRIGGERS)}")
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
     while True:
         try:
             api_cycle(); time.sleep(15)
         except Exception as e:
-            print(f"️ цикл: {e}"); time.sleep(30)
+            print(f"⚠️ цикл: {e}"); time.sleep(30)
 
 if __name__ == "__main__":
     main()
