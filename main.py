@@ -13,14 +13,14 @@ BOT_TOKEN               = os.getenv("BOT_TOKEN")
 CHANNEL_ID              = os.getenv("CHANNEL_ID")
 PREDICTION_CHANNEL_ID   = os.getenv("PREDICTION_CHANNEL_ID")
 MASTI_CHANNEL_ID        = os.getenv("MASTI_CHANNEL_ID")
-STATS_SOURCE_CHANNEL_ID = int(os.getenv("STATS_SOURCE_CHANNEL_ID"))
+STATS_SOURCE_CHANNEL_ID = int(os.getenv("STATS_SOURCE_CHANNEL_ID", "0"))
 DB_CHANNEL_ID           = os.getenv("DB_CHANNEL_ID")
 
 DB_PATH        = os.getenv("DB_PATH", "/data/totals_db.json")
-SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,3,4,5").split(","))
+SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,4,5").split(","))
 PRED_TIMEOUT   = int(os.getenv("PRED_TIMEOUT", 720))
 MAX_ACTIVE     = int(os.getenv("MAX_ACTIVE", 10))
-MAX_MAST_ACTIVE= int(os.getenv("MAX_MAST_ACTIVE", 2))  # 🔥 лимит активных прогнозов мастей
+MAX_MAST_ACTIVE= int(os.getenv("MAX_MAST_ACTIVE", 3))  # Лимит активных прогнозов мастей
 DB_DUMP_MIN    = int(os.getenv("DB_DUMP_MIN", 60))
 
 API_URL = "https://melbet-2814.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
@@ -30,7 +30,7 @@ SUITS_RE = re.compile(r'[♠♥♦♣]')
 ARROW_CHAR = '\U0001F448'
 
 SUITS_MAP = {
-    0: {"name": "Пики", "symbol": "️♠️"},
+    0: {"name": "Пики", "symbol": "♠️"},
     1: {"name": "Трефы", "symbol": "♣️"},
     2: {"name": "Бубны", "symbol": "♦️"},
     3: {"name": "Червы", "symbol": "♥️"}
@@ -51,12 +51,17 @@ di_to_pair = {}
 last_dump = 0.0
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
-def normalize(n): return ((n - 1) % 1440) + 1
-def pair_key(p): return f"{p:02d}"
+def normalize(n): 
+    return ((n - 1) % 1440) + 1
+
+def pair_key(p): 
+    return f"{p:02d}"
 
 def is_final_result(text):
-    if not text: return False
-    if ARROW_CHAR in text: return False
+    if not text: 
+        return False
+    if ARROW_CHAR in text: 
+        return False
     return True
 
 def get_suit_by_id(game_id):
@@ -69,24 +74,28 @@ def get_suit_by_id(game_id):
 def load_db():
     global totals_db, di_to_pair
     try:
-        with open(DB_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        totals_db  = data.get("totals", {})
-        di_to_pair = {int(k): v for k, v in data.get("di_to_pair", {}).items()}
-        print(f"💾 БД загружена: пар={len(totals_db)}, маппингов={len(di_to_pair)}")
-    except FileNotFoundError:
-        print("💾 БД не найдена, начинаем с нуля")
+        with lock:
+            if os.path.exists(DB_PATH):
+                with open(DB_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                totals_db  = data.get("totals", {})
+                di_to_pair = {int(k): v for k, v in data.get("di_to_pair", {}).items()}
+                print(f"💾 БД загружена: пар={len(totals_db)}, маппингов={len(di_to_pair)}")
+            else:
+                print("💾 БД не найдена, начинаем с нуля")
     except Exception as e:
         print(f"⚠️ load_db: {e}")
 
 def save_db():
     try:
         os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-        data = {"totals": totals_db, "di_to_pair": {str(k): v for k, v in di_to_pair.items()}}
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(DB_PATH) or ".")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, DB_PATH)
+        with lock:
+            data = {"totals": totals_db, "di_to_pair": {str(k): v for k, v in di_to_pair.items()}}
+            dir_name = os.path.dirname(DB_PATH) or "."
+            fd, tmp = tempfile.mkstemp(dir=dir_name)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, DB_PATH)
     except Exception as e:
         print(f"⚠️ save_db: {e}")
 
@@ -95,8 +104,8 @@ def record_total(pair, outcome):
     with lock:
         totals_db.setdefault(k, {})
         totals_db[k][outcome] = totals_db[k].get(outcome, 0) + 1
-        save_db()
-    print(f"📊 DB[{k}][{outcome}] = {totals_db[k][outcome]}")
+    save_db()
+    print(f"📊 DB[{k}][{outcome}] = {totals_db[k].get(outcome, 0)}")
 
 def parse_totals(text):
     groups = re.findall(r'\(([^)]*)\)', text or "")
@@ -115,12 +124,13 @@ def parse_player_suit(text):
 def build_dump():
     lines = ["📚 <b>БД ТОТАЛОВ (пара → исходы)</b>", "формат: пара | 2/2 2/3 3/2 3/3"]
     order = ["2/2", "2/3", "3/2", "3/3"]
-    for k in sorted(totals_db.keys()):
-        row = totals_db[k]
-        if not row: continue
-        main = " ".join(f"{o}:{row[o]}" for o in order if o in row)
-        extra = " ".join(f"{o}:{row[o]}" for o in sorted(row) if o not in order)
-        lines.append(f"<code>{k}</code> → {main}{('  '+extra) if extra else ''}  [всего {sum(row.values())}]")
+    with lock:
+        for k in sorted(totals_db.keys()):
+            row = totals_db[k]
+            if not row: continue
+            main = " ".join(f"{o}:{row[o]}" for o in order if o in row)
+            extra = " ".join(f"{o}:{row[o]}" for o in sorted(row) if o not in order)
+            lines.append(f"<code>{k}</code> → {main}{('  '+extra) if extra else ''}  [всего {sum(row.values())}]")
     if len(lines) == 2: lines.append("(пока пусто)")
     return "\n".join(lines)
 
@@ -150,7 +160,7 @@ def fetch_data():
     try:
         resp = requests.get(API_URL, headers=HEADERS, timeout=10)
         if resp.status_code == 200: return resp.json().get("Value", [])
-    except Exception as e: print(f"️ API: {e}")
+    except Exception as e: print(f"⚠️ API: {e}")
     return []
 
 def format_game_info(game):
@@ -168,7 +178,7 @@ def send_to_channel(text):
 def send_prediction(text):
     if not PREDICTION_CHANNEL_ID: return None
     try: return bot.send_message(PREDICTION_CHANNEL_ID, text)
-    except Exception as e: print(f"️ pred: {e}"); return None
+    except Exception as e: print(f"⚠️ pred: {e}"); return None
 
 def send_masti_prediction(text):
     if not MASTI_CHANNEL_ID: return None
@@ -189,16 +199,20 @@ def finalize(pred, success, detail):
             text=(f"🎯 Игра #N{pred['first_n']}\nВозможна Раздача (серия потока)\n"
                   f"проверка {pred['label']}\n{mark} {detail}"))
     except Exception as e: print(f"⚠️ edit: {e}")
-    if pred in active_preds: active_preds.remove(pred)
+    with lock:
+        if pred in active_preds: active_preds.remove(pred)
 
-def finalize_mast(display_id, result_text):
-    if display_id not in mast_preds: return
-    pred = mast_preds[display_id]
+def finalize_mast(pred_key, result_text):
+    """Финализация прогноза масти по ключу (display_id первого матча)"""
+    with lock:
+        if pred_key not in mast_preds: return
+        pred = mast_preds[pred_key]
+        del mast_preds[pred_key]
+        
     try:
-        text = f"🎯 Игра #N{display_id}\nИгрок {pred['suit_symbol']} {result_text}"
+        text = f"🎯 Игра #N{pred['first_n']}\nИгрок {pred['suit_symbol']} {result_text}"
         bot.edit_message_text(chat_id=MASTI_CHANNEL_ID, message_id=pred["msg_id"], text=text)
     except Exception as e: print(f"⚠️ edit mast: {e}")
-    del mast_preds[display_id]
 
 def _make_pred(first_n, second_n, label):
     with lock:
@@ -239,11 +253,9 @@ def flush_series(series):
         print(f"🚀 ПРОГНОЗ {label} (серия len={length})")
 
 def create_mast_prediction(game_id, display_id):
-    """🔥 Создаёт прогноз масти с лимитом активных"""
-    if display_id in mast_preds: return
-    
-    # Проверяем лимит активных прогнозов мастей
+    """Создаёт прогноз масти с проверкой лимита активных"""
     with lock:
+        if display_id in mast_preds: return
         if len(mast_preds) >= MAX_MAST_ACTIVE:
             print(f"⛔ лимит мастей {MAX_MAST_ACTIVE}, пропуск #N{display_id} (активных: {len(mast_preds)})")
             return
@@ -255,15 +267,16 @@ def create_mast_prediction(game_id, display_id):
     sent = send_masti_prediction(text)
     
     if sent:
-        mast_preds[display_id] = {
-            "msg_id": sent.message_id,
-            "suit_code": suit_code,
-            "suit_symbol": suit_info['symbol'],
-            "first_n": display_id,
-            "second_n": normalize(display_id + 1),
-            "checked": set(),
-            "created_at": time.time()
-        }
+        with lock:
+            mast_preds[display_id] = {
+                "msg_id": sent.message_id,
+                "suit_code": suit_code,
+                "suit_symbol": suit_info['symbol'],
+                "first_n": display_id,
+                "second_n": normalize(display_id + 1),
+                "checked": set(),
+                "created_at": time.time()
+            }
         print(f"🎯 МАСТЬ #N{display_id} → {suit_info['symbol']} (ID {game_id} mod3={suit_code}) | активных: {len(mast_preds)}")
 
 # ==================== ОБРАБОТЧИКИ TELEGRAM ====================
@@ -277,7 +290,7 @@ def process_stats_message(msg):
 
     if not is_final_result(msg.text):
         if ARROW_CHAR in msg.text:
-            print(f" промежуточный #N{num} (стрелка), пропускаем")
+            print(f"⏳ промежуточный #N{num} (стрелка), пропускаем")
         else:
             print(f"⏳ промежуточный #N{num}, текст: {msg.text[:100]!r}")
         return
@@ -290,40 +303,47 @@ def process_stats_message(msg):
         record_total(pair, outcome)
         processed_stats_nums.add(num)
     elif pair is None:
-        print(f"️ DB: пара для #N{num} неизвестна")
+        print(f"⚠️ DB: пара для #N{num} неизвестна")
     elif outcome is None:
         print(f"⚠️ DB: не удалось распарсить тотал для #N{num}")
 
     # 1. Проверка прогнозов натуралов
     with lock:
-        for pred in list(active_preds):
-            if num in {pred["first_n"], pred["second_n"]} and num not in pred["checked"]:
-                pred["checked"].add(num)
-                if has_nat:
-                    pos = "0️" if num == pred["first_n"] else "1️⃣"
-                    finalize(pred, True, f"{pos} #N{num} → Натурал #R")
-                    print(f" НАТУРАЛ #N{num} ({pos})")
-                elif len(pred["checked"]) >= 2:
-                    finalize(pred, False, "❌ не зашло")
-                    print(f"❌ нет #R в {pred['label']}")
-
-    # 2. Проверка прогнозов мастей
-    if num in mast_preds:
-        pred = mast_preds[num]
-        actual_suit = parse_player_suit(msg.text)
+        preds_to_check = list(active_preds)
         
-        if actual_suit:
-            if actual_suit == pred["suit_symbol"]:
+    for pred in preds_to_check:
+        if num in {pred["first_n"], pred["second_n"]} and num not in pred["checked"]:
+            pred["checked"].add(num)
+            if has_nat:
                 pos = "0️⃣" if num == pred["first_n"] else "1️⃣"
-                finalize_mast(num, f"✅{pos}")
-                print(f"🎉 МАСТЬ УГАДАНА #N{num} ({pos})")
+                finalize(pred, True, f"{pos} #N{num} → Натурал #R")
+                print(f"🎉 НАТУРАЛ #N{num} ({pos})")
+            elif len(pred["checked"]) >= 2:
+                finalize(pred, False, "❌ не зашло")
+                print(f"❌ нет #R в {pred['label']}")
+
+    # 2. Исправленная проверка прогнозов мастей (поддерживает догон на 1️⃣ шаг)
+    with lock:
+        masti_to_check = list(mast_preds.items())
+
+    for pred_key, pred in masti_to_check:
+        if num in {pred["first_n"], pred["second_n"]} and num not in pred["checked"]:
+            pred["checked"].add(num)
+            actual_suit = parse_player_suit(msg.text)
+            
+            if actual_suit:
+                if actual_suit == pred["suit_symbol"]:
+                    pos = "0️⃣" if num == pred["first_n"] else "1️⃣"
+                    finalize_mast(pred_key, f"✅{pos}")
+                    print(f"🎉 МАСТЬ УГАДАНА #N{num} (шаг {pos})")
+                else:
+                    if len(pred["checked"]) >= 2:
+                        finalize_mast(pred_key, "")
+                        print(f"❌ МАСТЬ НЕ УГАДАНА (#N{pred['first_n']}/#N{pred['second_n']})")
+                    else:
+                        print(f"⏳ Шаг 0️⃣ (#N{num}) не зашёл для масти {pred['suit_symbol']}. Ждем 1️⃣ шаг (#N{pred['second_n']})")
             else:
-                pred["checked"].add(num)
-                if len(pred["checked"]) >= 2:
-                    finalize_mast(num, "")
-                    print(f"❌ МАСТЬ НЕ УГАДАНА #N{num}")
-        else:
-            print(f"⚠️ Не удалось распарсить масть для #N{num}")
+                print(f"⚠️ Не удалось распарсить масть у игрока для #N{num}")
 
 @bot.channel_post_handler()
 def on_stats(msg):
@@ -350,18 +370,21 @@ def api_cycle():
     games = fetch_data()
     if not games: return
 
+    # Таймауты активных прогнозов
     with lock:
         for pred in list(active_preds):
             if time.time() - pred["created_at"] > PRED_TIMEOUT:
-                finalize(pred, False, " таймаут ожидания #R")
-        for display_id, pred in list(mast_preds.items()):
+                finalize(pred, False, "⌛ таймаут ожидания #R")
+                
+        for pred_key, pred in list(mast_preds.items()):
             if time.time() - pred["created_at"] > PRED_TIMEOUT:
-                finalize_mast(display_id, "⏰")
-                print(f" таймаут масти #N{display_id}")
+                finalize_mast(pred_key, "⏰")
+                print(f"⌛ таймаут масти #N{pred_key}")
 
     new_games = []
     for game in games:
-        gid = game.get("I"); di = game.get("DI")
+        gid = game.get("I")
+        di = game.get("DI")
         if not gid or gid in sent_games: continue
         sent_games.add(gid)
         new_games.append(game)
@@ -370,10 +393,12 @@ def api_cycle():
         if di: 
             di_to_pair[int(di)] = (int(gid) // 100) % 100
             create_mast_prediction(int(gid), int(di))
+            
     new_games.sort(key=lambda g: int(g.get("DI") or 0))
 
     for game in new_games:
-        gid = game.get("I"); di = game.get("DI")
+        gid = game.get("I")
+        di = game.get("DI")
         if not di: continue
         pair = (int(gid) // 100) % 100
         
@@ -389,21 +414,30 @@ def api_cycle():
     if new_games:
         print(f"✅ Новых: {len(new_games)} | серия пара={current_series['pair']} len={len(current_series['dis'])}")
         save_db()
-    if len(sent_games) > 300: sent_games.clear()
+        
+    if len(sent_games) > 300: 
+        sent_games.clear()
 
     if DB_CHANNEL_ID and time.time() - last_dump > DB_DUMP_MIN * 60:
-        send_dump(); last_dump = time.time()
+        send_dump()
+        last_dump = time.time()
 
 def main():
     load_db()
     print(f"🚀 ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | triggers={sorted(SERIES_TRIGGERS)} | db={DB_PATH}")
     send_to_channel(f"🟢 <b>Бот запущен</b> | триггеры серии: {sorted(SERIES_TRIGGERS)} | макс. мастей: {MAX_MAST_ACTIVE}")
+    
+    # Поток обработчика телеграм-сообщений
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
+    
+    # Главный цикл опроса API
     while True:
         try:
-            api_cycle(); time.sleep(15)
+            api_cycle()
+            time.sleep(15)
         except Exception as e:
-            print(f"⚠️ цикл: {e}"); time.sleep(30)
+            print(f"⚠️ ошибка цикла: {e}")
+            time.sleep(30)
 
 if __name__ == "__main__":
     main()
