@@ -1,12 +1,11 @@
 import os
 import time
 import re
-import json
 import datetime
 import threading
-import tempfile
 import requests
 import telebot
+from telebot.apihelper import ApiTelegramException
 
 # ==================== НАСТРОЙКИ (ENV) ====================
 BOT_TOKEN               = os.getenv("BOT_TOKEN")
@@ -14,14 +13,11 @@ CHANNEL_ID              = os.getenv("CHANNEL_ID")
 PREDICTION_CHANNEL_ID   = os.getenv("PREDICTION_CHANNEL_ID")
 MASTI_CHANNEL_ID        = os.getenv("MASTI_CHANNEL_ID")
 STATS_SOURCE_CHANNEL_ID = int(os.getenv("STATS_SOURCE_CHANNEL_ID", "0"))
-DB_CHANNEL_ID           = os.getenv("DB_CHANNEL_ID")
 
-DB_PATH        = os.getenv("DB_PATH", "/data/totals_db.json")
-SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,4,5").split(","))
+SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,3,4,5").split(","))
 PRED_TIMEOUT   = int(os.getenv("PRED_TIMEOUT", 720))
 MAX_ACTIVE     = int(os.getenv("MAX_ACTIVE", 10))
-MAX_MAST_ACTIVE= int(os.getenv("MAX_MAST_ACTIVE", 3))  # Лимит активных прогнозов мастей
-DB_DUMP_MIN    = int(os.getenv("DB_DUMP_MIN", 60))
+MAX_MAST_ACTIVE= int(os.getenv("MAX_MAST_ACTIVE", 4))  # Лимит активных прогнозов мастей
 
 API_URL = "https://melbet-2814.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"}
@@ -46,16 +42,9 @@ current_series = {"pair": None, "dis": [], "published": False}
 processed_stats_nums = set()
 mast_preds = {}
 
-totals_db = {}
-di_to_pair = {}
-last_dump = 0.0
-
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
 def normalize(n): 
     return ((n - 1) % 1440) + 1
-
-def pair_key(p): 
-    return f"{p:02d}"
 
 def is_final_result(text):
     if not text: 
@@ -70,90 +59,11 @@ def get_suit_by_id(game_id):
         return 3
     return last_digit % 3
 
-# ==================== БД ====================
-def load_db():
-    global totals_db, di_to_pair
-    try:
-        with lock:
-            if os.path.exists(DB_PATH):
-                with open(DB_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                totals_db  = data.get("totals", {})
-                di_to_pair = {int(k): v for k, v in data.get("di_to_pair", {}).items()}
-                print(f"💾 БД загружена: пар={len(totals_db)}, маппингов={len(di_to_pair)}")
-            else:
-                print("💾 БД не найдена, начинаем с нуля")
-    except Exception as e:
-        print(f"⚠️ load_db: {e}")
-
-def save_db():
-    try:
-        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-        with lock:
-            data = {"totals": totals_db, "di_to_pair": {str(k): v for k, v in di_to_pair.items()}}
-            dir_name = os.path.dirname(DB_PATH) or "."
-            fd, tmp = tempfile.mkstemp(dir=dir_name)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
-            os.replace(tmp, DB_PATH)
-    except Exception as e:
-        print(f"⚠️ save_db: {e}")
-
-def record_total(pair, outcome):
-    k = pair_key(pair)
-    with lock:
-        totals_db.setdefault(k, {})
-        totals_db[k][outcome] = totals_db[k].get(outcome, 0) + 1
-    save_db()
-    print(f"📊 DB[{k}][{outcome}] = {totals_db[k].get(outcome, 0)}")
-
-def parse_totals(text):
-    groups = re.findall(r'\(([^)]*)\)', text or "")
-    if len(groups) < 2: return None
-    p = len(SUITS_RE.findall(groups[0]))
-    d = len(SUITS_RE.findall(groups[1]))
-    if p == 0 or d == 0: return None
-    return f"{p}/{d}"
-
 def parse_player_suit(text):
     groups = re.findall(r'\(([^)]*)\)', text or "")
     if len(groups) < 1: return None
     suits = SUITS_RE.findall(groups[0])
     return suits[0] if suits else None
-
-def build_dump():
-    lines = ["📚 <b>БД ТОТАЛОВ (пара → исходы)</b>", "формат: пара | 2/2 2/3 3/2 3/3"]
-    order = ["2/2", "2/3", "3/2", "3/3"]
-    with lock:
-        for k in sorted(totals_db.keys()):
-            row = totals_db[k]
-            if not row: continue
-            main = " ".join(f"{o}:{row[o]}" for o in order if o in row)
-            extra = " ".join(f"{o}:{row[o]}" for o in sorted(row) if o not in order)
-            lines.append(f"<code>{k}</code> → {main}{('  '+extra) if extra else ''}  [всего {sum(row.values())}]")
-    if len(lines) == 2: lines.append("(пока пусто)")
-    return "\n".join(lines)
-
-def send_dump():
-    if not DB_CHANNEL_ID: return
-    txt = build_dump()
-    for i in range(0, len(txt), 4000):
-        try: bot.send_message(DB_CHANNEL_ID, txt[i:i+4000], parse_mode="HTML")
-        except Exception as e: print(f"⚠️ dump send: {e}")
-    send_db_file()
-
-def send_db_file(chat_id=None):
-    cid = chat_id or DB_CHANNEL_ID
-    if not cid: return
-    try:
-        if not os.path.exists(DB_PATH):
-            if chat_id: bot.send_message(cid, "⚠️ Файл БД ещё не создан")
-            return
-        with open(DB_PATH, "rb") as f:
-            bot.send_document(cid, f, caption="📦 Бэкап totals_db.json", visible_file_name="totals_db.json")
-        print(f"📤 Файл БД отправлен в {cid}")
-    except Exception as e:
-        print(f"⚠️ send_db_file: {e}")
 
 # ==================== API / TG ====================
 def fetch_data():
@@ -172,6 +82,7 @@ def format_game_info(game):
         print(f"⚠️ fmt: {e}"); return None
 
 def send_to_channel(text):
+    if not CHANNEL_ID: return False
     try: bot.send_message(CHANNEL_ID, text, parse_mode="HTML"); return True
     except Exception as e: print(f"⚠️ send: {e}"); return False
 
@@ -198,9 +109,15 @@ def finalize(pred, success, detail):
             chat_id=PREDICTION_CHANNEL_ID, message_id=pred["msg_id"],
             text=(f"🎯 Игра #N{pred['first_n']}\nВозможна Раздача (серия потока)\n"
                   f"проверка {pred['label']}\n{mark} {detail}"))
-    except Exception as e: print(f"⚠️ edit: {e}")
+    except ApiTelegramException as e:
+        if "message is not modified" not in e.description and "message to edit not found" not in e.description:
+            print(f"⚠️ edit err: {e}")
+    except Exception as e: 
+        print(f"⚠️ edit: {e}")
+        
     with lock:
-        if pred in active_preds: active_preds.remove(pred)
+        if pred in active_preds: 
+            active_preds.remove(pred)
 
 def finalize_mast(pred_key, result_text):
     """Финализация прогноза масти по ключу (display_id первого матча)"""
@@ -212,7 +129,11 @@ def finalize_mast(pred_key, result_text):
     try:
         text = f"🎯 Игра #N{pred['first_n']}\nИгрок {pred['suit_symbol']} {result_text}"
         bot.edit_message_text(chat_id=MASTI_CHANNEL_ID, message_id=pred["msg_id"], text=text)
-    except Exception as e: print(f"⚠️ edit mast: {e}")
+    except ApiTelegramException as e:
+        if "message is not modified" not in e.description and "message to edit not found" not in e.description:
+            print(f"⚠️ edit mast err: {e}")
+    except Exception as e: 
+        print(f"⚠️ edit mast: {e}")
 
 def _make_pred(first_n, second_n, label):
     with lock:
@@ -295,17 +216,8 @@ def process_stats_message(msg):
             print(f"⏳ промежуточный #N{num}, текст: {msg.text[:100]!r}")
         return
 
-    pair = di_to_pair.get(num)
-    outcome = parse_totals(msg.text)
-    print(f"🔎 ФИНАЛ #N{num} | пара={pair} | тотал={outcome} | #R={has_nat}")
-
-    if pair is not None and outcome:
-        record_total(pair, outcome)
-        processed_stats_nums.add(num)
-    elif pair is None:
-        print(f"⚠️ DB: пара для #N{num} неизвестна")
-    elif outcome is None:
-        print(f"⚠️ DB: не удалось распарсить тотал для #N{num}")
+    processed_stats_nums.add(num)
+    print(f"🔎 ФИНАЛ #N{num} | #R={has_nat}")
 
     # 1. Проверка прогнозов натуралов
     with lock:
@@ -322,7 +234,7 @@ def process_stats_message(msg):
                 finalize(pred, False, "❌ не зашло")
                 print(f"❌ нет #R в {pred['label']}")
 
-    # 2. Исправленная проверка прогнозов мастей (поддерживает догон на 1️⃣ шаг)
+    # 2. Проверка прогнозов мастей
     with lock:
         masti_to_check = list(mast_preds.items())
 
@@ -355,18 +267,9 @@ def on_stats_edited(msg):
     print(f"✏️ EDITED POST chat.id={msg.chat.id} | {(msg.text or '')[:80]!r}")
     process_stats_message(msg)
 
-@bot.message_handler(commands=["db"])
-def cmd_db(m):
-    try: bot.send_message(m.chat.id, build_dump(), parse_mode="HTML")
-    except Exception as e: print(f"⚠️ cmd_db: {e}")
-
-@bot.message_handler(commands=["dbfile"])
-def cmd_dbfile(m):
-    send_db_file(m.chat.id)
-
 # ==================== ГЛАВНЫЙ ЦИКЛ ====================
 def api_cycle():
-    global current_series, last_dump
+    global current_series
     games = fetch_data()
     if not games: return
 
@@ -391,7 +294,6 @@ def api_cycle():
         text = format_game_info(game)
         if text: send_to_channel(text)
         if di: 
-            di_to_pair[int(di)] = (int(gid) // 100) % 100
             create_mast_prediction(int(gid), int(di))
             
     new_games.sort(key=lambda g: int(g.get("DI") or 0))
@@ -413,18 +315,12 @@ def api_cycle():
 
     if new_games:
         print(f"✅ Новых: {len(new_games)} | серия пара={current_series['pair']} len={len(current_series['dis'])}")
-        save_db()
         
     if len(sent_games) > 300: 
         sent_games.clear()
 
-    if DB_CHANNEL_ID and time.time() - last_dump > DB_DUMP_MIN * 60:
-        send_dump()
-        last_dump = time.time()
-
 def main():
-    load_db()
-    print(f"🚀 ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | triggers={sorted(SERIES_TRIGGERS)} | db={DB_PATH}")
+    print(f"🚀 ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | triggers={sorted(SERIES_TRIGGERS)} | макс. мастей: {MAX_MAST_ACTIVE}")
     send_to_channel(f"🟢 <b>Бот запущен</b> | триггеры серии: {sorted(SERIES_TRIGGERS)} | макс. мастей: {MAX_MAST_ACTIVE}")
     
     # Поток обработчика телеграм-сообщений
