@@ -16,7 +16,7 @@ STATS_SOURCE_CHANNEL_ID = int(os.getenv("STATS_SOURCE_CHANNEL_ID"))
 API_URL = "https://melbet-2814.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"}
 
-SERIES_START = int(os.getenv("SERIES_START", 3))      # длина пары-серии для старта публикаций
+SERIES_START = int(os.getenv("SERIES_START", 2))   # мин. длина серии для публикаций (2 = одна пара)
 PRED_TIMEOUT = int(os.getenv("PRED_TIMEOUT", 720))
 MAX_ACTIVE   = int(os.getenv("MAX_ACTIVE", 10))
 
@@ -25,7 +25,7 @@ lock = threading.Lock()
 
 sent_games   = set()
 active_preds = []
-current_series = {"pair": None, "dis": [], "published": set()}   # серия по паре (gid//100)%100
+current_series = {"pair": None, "dis": [], "published": set()}
 
 def normalize(n): return ((n - 1) % 1440) + 1
 
@@ -63,27 +63,50 @@ def parse_stats(text):
 def finalize(pred, success, detail):
     try:
         mark = "✅" if success else "❌"
-        t = pred["target_n"]
         bot.edit_message_text(
             chat_id=PREDICTION_CHANNEL_ID, message_id=pred["msg_id"],
-            text=(f"🎯 Игра #N{t}\nВозможна Раздача (серия потока)\n"
-                  f"проверка #N{t}\n{mark} {detail}"))
+            text=(f"🎯 Игра #N{pred['first_n']}\nВозможна Раздача (серия потока)\n"
+                  f"проверка {pred['label']}\n{mark} {detail}"))
     except Exception as e: print(f"⚠️ edit: {e}")
     if pred in active_preds: active_preds.remove(pred)
 
-def publish_for(dis):
-    for d in dis:
-        if d in current_series["published"]: continue
-        with lock:
-            if len(active_preds) >= MAX_ACTIVE:
-                print(f"⛔ лимит {MAX_ACTIVE}, пропуск #N{d}"); continue
-        t = int(d)
-        sent = send_prediction(f"🎯 Игра #N{t}\nВозможна Раздача (серия потока)\nпроверка #N{t}\n⏳ Ожидание #R...")
-        if sent:
-            with lock:
-                active_preds.append({"msg_id": sent.message_id, "target_n": t, "created_at": time.time()})
-            current_series["published"].add(d)
-            print(f"🚀 ПРОГНОЗ #N{t} (пара={current_series['pair']}, длина={len(current_series['dis'])})")
+def _make_pred(first_n, label, targets_norm):
+    with lock:
+        if len(active_preds) >= MAX_ACTIVE:
+            print(f"⛔ лимит {MAX_ACTIVE}, пропуск {label}"); return False
+    text = (f"🎯 Игра #N{first_n}\nВозможна Раздача (серия потока)\n"
+            f"проверка {label}\n⏳ Ожидание #R...")
+    sent = send_prediction(text)
+    if not sent: return False
+    with lock:
+        active_preds.append({"msg_id": sent.message_id, "targets_norm": targets_norm,
+                             "checked": set(), "created_at": time.time(),
+                             "first_n": first_n, "label": label})
+    return True
+
+def publish_pair(a, b, published):
+    label = f"#N{int(a)}/#N{int(b)}"
+    if _make_pred(int(a), label, {normalize(int(a)), normalize(int(b))}):
+        published.add(a); published.add(b)
+        print(f"🚀 ПРОГНОЗ-ПАРА {label} (длина серии={len(current_series['dis'])})")
+
+def publish_single(a, published):
+    label = f"#N{int(a)}"
+    if _make_pred(int(a), label, {normalize(int(a))}):
+        published.add(a)
+        print(f"🚀 ПРОГНОЗ-ОДИНОЧКА {label} (хвост серии)")
+
+def flush_series(series, tail):
+    """Публикует полные пары из series; при tail=True — и непарный хвост."""
+    dis, published = series["dis"], series["published"]
+    if len(dis) < SERIES_START: return
+    i = 0
+    while i + 1 < len(dis):
+        if dis[i + 1] not in published:
+            publish_pair(dis[i], dis[i + 1], published)
+        i += 2
+    if tail and len(dis) % 2 == 1 and dis[-1] not in published:
+        publish_single(dis[-1], published)
 
 @bot.channel_post_handler()
 def on_stats(msg):
@@ -95,11 +118,12 @@ def on_stats(msg):
     print(f"🔎 #N{num} #R={has_nat} | активных={len(active_preds)}")
     with lock:
         for pred in list(active_preds):
-            if num == normalize(pred["target_n"]):
+            if num in pred["targets_norm"] and num not in pred["checked"]:
+                pred["checked"].add(num)
                 if has_nat:
                     finalize(pred, True, f"#N{num} → Натурал #R"); print(f"🎉 НАТУРАЛ #N{num}")
-                else:
-                    finalize(pred, False, f"#N{num} без #R"); print(f"❌ нет #R на #N{num}")
+                elif len(pred["checked"]) >= len(pred["targets_norm"]):
+                    finalize(pred, False, f"в {pred['label']} нет #R"); print(f"❌ нет #R {pred['label']}")
 
 def api_cycle():
     global current_series
@@ -124,16 +148,16 @@ def api_cycle():
     for game in new_games:
         gid = game.get("I"); di = game.get("DI")
         if not di: continue
-        pair = (int(gid) // 100) % 100                      # 🔥 маркер серии
+        pair = (int(gid) // 100) % 100
 
         if current_series["pair"] is not None and pair == (current_series["pair"] + 1) % 100:
-            current_series["dis"].append(di)                 # серия +1
+            current_series["dis"].append(di)
         else:
-            current_series = {"pair": pair, "dis": [di], "published": set()}  # обрыв
+            flush_series(current_series, tail=True)                      # обрыв → допубликовать хвост
+            current_series = {"pair": pair, "dis": [di], "published": set()}
         current_series["pair"] = pair
 
-        if len(current_series["dis"]) >= SERIES_START:
-            publish_for(current_series["dis"])               # ретроактивно на все игры серии
+        flush_series(current_series, tail=False)                         # рост → полные пары ретроактивно
 
     if new_games:
         print(f"✅ Новых: {len(new_games)} | серия пара={current_series['pair']} len={len(current_series['dis'])}")
@@ -141,7 +165,7 @@ def api_cycle():
 
 def main():
     print(f"🚀 ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | series_start={SERIES_START} | timeout={PRED_TIMEOUT} | max_active={MAX_ACTIVE}")
-    send_to_channel("🟢 <b>Бот запущен (серия по паре ID + Натурал)</b>")
+    send_to_channel("🟢 <b>Бот запущен (прогнозы ПАРАМИ по серии потока)</b>")
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
     while True:
         try:
