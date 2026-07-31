@@ -16,7 +16,7 @@ STATS_SOURCE_CHANNEL_ID = int(os.getenv("STATS_SOURCE_CHANNEL_ID")) # канал
 DB_CHANNEL_ID           = os.getenv("DB_CHANNEL_ID")           # канал для бэкапов БД (опционально)
 
 DB_PATH        = os.getenv("DB_PATH", "/data/totals_db.json")  # путь к БД (на Railway нужен Volume /data)
-SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,4").split(",")) # точные длины серий
+SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,3").split(",")) # точные длины серий
 PRED_TIMEOUT   = int(os.getenv("PRED_TIMEOUT", 720))
 MAX_ACTIVE     = int(os.getenv("MAX_ACTIVE", 10))
 DB_DUMP_MIN    = int(os.getenv("DB_DUMP_MIN", 60))             # авто-бэкап раз в N минут
@@ -32,6 +32,7 @@ lock = threading.Lock()
 sent_games   = set()
 active_preds = []
 current_series = {"pair": None, "dis": [], "published": set()}
+processed_stats_nums = set()  # 🔥 защита от дублей в БД
 
 totals_db = {}
 di_to_pair = {}
@@ -40,6 +41,13 @@ last_dump = 0.0
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
 def normalize(n): return ((n - 1) % 1440) + 1
 def pair_key(p): return f"{p:02d}"
+
+def is_final_result(text):
+    """True только для финального результата раздачи"""
+    if not text: return False
+    if '' in text: return False      # стрелка = "ещё идёт"
+    if '✅' not in text: return False  # нет маркера победителя — не финал
+    return True
 
 # ==================== БД ====================
 def load_db():
@@ -64,7 +72,7 @@ def save_db():
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp, DB_PATH)
     except Exception as e:
-        print(f"⚠️ save_db: {e}")
+        print(f"️ save_db: {e}")
 
 def record_total(pair, outcome):
     k = pair_key(pair)
@@ -72,7 +80,7 @@ def record_total(pair, outcome):
         totals_db.setdefault(k, {})
         totals_db[k][outcome] = totals_db[k].get(outcome, 0) + 1
         save_db()
-    print(f"📊 DB[{k}][{outcome}] = {totals_db[k][outcome]}")
+    print(f" DB[{k}][{outcome}] = {totals_db[k][outcome]}")
 
 def parse_totals(text):
     groups = re.findall(r'\(([^)]*)\)', text or "")
@@ -99,15 +107,15 @@ def send_dump():
     txt = build_dump()
     for i in range(0, len(txt), 4000):
         try: bot.send_message(DB_CHANNEL_ID, txt[i:i+4000], parse_mode="HTML")
-        except Exception as e: print(f"⚠️ dump send: {e}")
-    send_db_file()  # отправляем файл следом
+        except Exception as e: print(f"️ dump send: {e}")
+    send_db_file()
 
 def send_db_file(chat_id=None):
     cid = chat_id or DB_CHANNEL_ID
     if not cid: return
     try:
         if not os.path.exists(DB_PATH):
-            if chat_id: bot.send_message(cid, "️ Файл БД ещё не создан")
+            if chat_id: bot.send_message(cid, "⚠️ Файл БД ещё не создан")
             return
         with open(DB_PATH, "rb") as f:
             bot.send_document(cid, f, caption="📦 Бэкап totals_db.json",
@@ -121,18 +129,16 @@ def fetch_data():
     try:
         resp = requests.get(API_URL, headers=HEADERS, timeout=10)
         if resp.status_code == 200: return resp.json().get("Value", [])
-    except Exception as e: print(f"⚠️ API: {e}")
+    except Exception as e: print(f"️ API: {e}")
     return []
 
 def format_game_info(game):
     try:
         return (
             f"🎮 ИГРА #N{game.get('I','N/A')}   Display ID: {game.get('DI','N/A')}\n"
-            f"──────────────────────────────\n📊 Информация:\n  Спорт: {game.get('SN','N/A')}\n"
-            f"  Системные данные:\n  Event Counter: {game.get('EC','N/A')}\n"
-            f"  League ID: {game.get('LI','N/A')}\n  Sport ID: {game.get('SI','N/A')}")
+            f"──────────────────────────────\n")
     except Exception as e:
-        print(f"⚠️ fmt: {e}"); return None
+        print(f"️ fmt: {e}"); return None
 
 def send_to_channel(text):
     try: bot.send_message(CHANNEL_ID, text, parse_mode="HTML"); return True
@@ -153,7 +159,7 @@ def finalize(pred, success, detail):
         mark = "✅" if success else "❌"
         bot.edit_message_text(
             chat_id=PREDICTION_CHANNEL_ID, message_id=pred["msg_id"],
-            text=(f" Игра #N{pred['first_n']}\nВозможна Раздача (серия потока)\n"
+            text=(f"🎯 Игра #N{pred['first_n']}\nВозможна Раздача (серия потока)\n"
                   f"проверка {pred['label']}\n{mark} {detail}"))
     except Exception as e: print(f"⚠️ edit: {e}")
     if pred in active_preds: active_preds.remove(pred)
@@ -161,9 +167,9 @@ def finalize(pred, success, detail):
 def _make_pred(first_n, label, targets_norm):
     with lock:
         if len(active_preds) >= MAX_ACTIVE:
-            print(f"⛔ лимит {MAX_ACTIVE}, пропуск {label}"); return False
-    text = (f"🎯 Игра #N{first_n}\nВозможна Раздача (серия потока)\n"
-            f"проверка {label}\n⏳ Ожидание #R...")
+            print(f" лимит {MAX_ACTIVE}, пропуск {label}"); return False
+    text = (f" Игра #N{first_n}\nВозможна Раздача (серия потока)\n"
+            f"проверка {label}\n Ожидание #R...")
     sent = send_prediction(text)
     if not sent: return False
     with lock:
@@ -182,7 +188,7 @@ def publish_single(a, published):
     label = f"#N{int(a)}"
     if _make_pred(int(a), label, {normalize(int(a))}):
         published.add(a)
-        print(f"🚀 ОДИНОЧКА {label}")
+        print(f" ОДИНОЧКА {label}")
 
 def flush_series(series, tail):
     dis, published = series["dis"], series["published"]
@@ -197,35 +203,50 @@ def flush_series(series, tail):
 # ==================== ОБРАБОТЧИКИ TELEGRAM ====================
 @bot.channel_post_handler()
 def on_stats(msg):
-    print(f"📨 POST chat.id={msg.chat.id} | {(msg.text or '')[:60]!r}")
+    print(f"📨 POST chat.id={msg.chat.id} | {(msg.text or '')[:80]!r}")
     if msg.chat.id != STATS_SOURCE_CHANNEL_ID: return
     parsed = parse_stats(msg.text)
     if not parsed: return
     num, has_nat = parsed
 
+    # 🔥 защита от дублей
+    if num in processed_stats_nums:
+        return
+
+    # 🔥 фильтр: только финальный результат
+    if not is_final_result(msg.text):
+        print(f"⏳ промежуточный апдейт #N{num}, пропускаем")
+        return
+
     # Запись в БД
     pair = di_to_pair.get(num)
     outcome = parse_totals(msg.text)
+    print(f"🔎 ФИНАЛ #N{num} | пара={pair} | тотал={outcome} | #R={has_nat}")
+
     if pair is not None and outcome:
         record_total(pair, outcome)
+        processed_stats_nums.add(num)
     elif pair is None:
         print(f"⚠️ DB: пара для #N{num} неизвестна")
+    elif outcome is None:
+        print(f"⚠️ DB: не удалось распарсить тотал для #N{num}")
 
     # Проверка прогнозов
-    print(f" #N{num} #R={has_nat} | активных={len(active_preds)}")
     with lock:
         for pred in list(active_preds):
             if num in pred["targets_norm"] and num not in pred["checked"]:
                 pred["checked"].add(num)
                 if has_nat:
-                    finalize(pred, True, f"#N{num} → Натурал #R"); print(f"🎉 НАТУРАЛ #N{num}")
+                    finalize(pred, True, f"#N{num} → Натурал #R")
+                    print(f" НАТУРАЛ #N{num}")
                 elif len(pred["checked"]) >= len(pred["targets_norm"]):
-                    finalize(pred, False, f"в {pred['label']} нет #R"); print(f"❌ нет #R {pred['label']}")
+                    finalize(pred, False, f"в {pred['label']} нет #R")
+                    print(f"❌ нет #R {pred['label']}")
 
 @bot.message_handler(commands=["db"])
 def cmd_db(m):
     try: bot.send_message(m.chat.id, build_dump(), parse_mode="HTML")
-    except Exception as e: print(f"⚠️ cmd_db: {e}")
+    except Exception as e: print(f"️ cmd_db: {e}")
 
 @bot.message_handler(commands=["dbfile"])
 def cmd_dbfile(m):
@@ -240,7 +261,7 @@ def api_cycle():
     with lock:
         for pred in list(active_preds):
             if time.time() - pred["created_at"] > PRED_TIMEOUT:
-                finalize(pred, False, " таймаут ожидания #R")
+                finalize(pred, False, "⏰ таймаут ожидания #R")
 
     new_games = []
     for game in games:
@@ -264,7 +285,6 @@ def api_cycle():
             current_series = {"pair": pair, "dis": [di], "published": set()}
         current_series["pair"] = pair
 
-        # 🔥 Триггер срабатывает ТОЛЬКО если длина серии ровно в наборе
         if len(current_series["dis"]) in SERIES_TRIGGERS:
             flush_series(current_series, tail=True)
 
