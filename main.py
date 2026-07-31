@@ -16,7 +16,7 @@ STATS_SOURCE_CHANNEL_ID = int(os.getenv("STATS_SOURCE_CHANNEL_ID"))
 DB_CHANNEL_ID           = os.getenv("DB_CHANNEL_ID")
 
 DB_PATH        = os.getenv("DB_PATH", "/data/totals_db.json")
-SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,3,5").split(","))
+SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,3,4,5").split(","))
 PRED_TIMEOUT   = int(os.getenv("PRED_TIMEOUT", 720))
 MAX_ACTIVE     = int(os.getenv("MAX_ACTIVE", 10))
 DB_DUMP_MIN    = int(os.getenv("DB_DUMP_MIN", 60))
@@ -44,7 +44,7 @@ def pair_key(p): return f"{p:02d}"
 
 def is_final_result(text):
     if not text: return False
-    if '👈' in text: return False
+    if '' in text: return False
     return True
 
 # ==================== БД ====================
@@ -57,7 +57,7 @@ def load_db():
         di_to_pair = {int(k): v for k, v in data.get("di_to_pair", {}).items()}
         print(f"💾 БД загружена: пар={len(totals_db)}, маппингов={len(di_to_pair)}")
     except FileNotFoundError:
-        print("💾 БД не найдена, начинаем с нуля")
+        print(" БД не найдена, начинаем с нуля")
     except Exception as e:
         print(f"⚠️ load_db: {e}")
 
@@ -70,7 +70,7 @@ def save_db():
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp, DB_PATH)
     except Exception as e:
-        print(f"️ save_db: {e}")
+        print(f"⚠️ save_db: {e}")
 
 def record_total(pair, outcome):
     k = pair_key(pair)
@@ -78,7 +78,7 @@ def record_total(pair, outcome):
         totals_db.setdefault(k, {})
         totals_db[k][outcome] = totals_db[k].get(outcome, 0) + 1
         save_db()
-    print(f" DB[{k}][{outcome}] = {totals_db[k][outcome]}")
+    print(f"📊 DB[{k}][{outcome}] = {totals_db[k][outcome]}")
 
 def parse_totals(text):
     groups = re.findall(r'\(([^)]*)\)', text or "")
@@ -105,7 +105,7 @@ def send_dump():
     txt = build_dump()
     for i in range(0, len(txt), 4000):
         try: bot.send_message(DB_CHANNEL_ID, txt[i:i+4000], parse_mode="HTML")
-        except Exception as e: print(f"⚠️ dump send: {e}")
+        except Exception as e: print(f"️ dump send: {e}")
     send_db_file()
 
 def send_db_file(chat_id=None):
@@ -113,10 +113,10 @@ def send_db_file(chat_id=None):
     if not cid: return
     try:
         if not os.path.exists(DB_PATH):
-            if chat_id: bot.send_message(cid, "️ Файл БД ещё не создан")
+            if chat_id: bot.send_message(cid, "⚠️ Файл БД ещё не создан")
             return
         with open(DB_PATH, "rb") as f:
-            bot.send_document(cid, f, caption="📦 Бэкап totals_db.json",
+            bot.send_document(cid, f, caption=" Бэкап totals_db.json",
                               visible_file_name="totals_db.json")
         print(f"📤 Файл БД отправлен в {cid}")
     except Exception as e:
@@ -127,7 +127,7 @@ def fetch_data():
     try:
         resp = requests.get(API_URL, headers=HEADERS, timeout=10)
         if resp.status_code == 200: return resp.json().get("Value", [])
-    except Exception as e: print(f"⚠️ API: {e}")
+    except Exception as e: print(f"️ API: {e}")
     return []
 
 def format_game_info(game):
@@ -144,7 +144,7 @@ def send_to_channel(text):
 
 def send_prediction(text):
     try: return bot.send_message(PREDICTION_CHANNEL_ID, text)
-    except Exception as e: print(f"⚠️ pred: {e}"); return None
+    except Exception as e: print(f"️ pred: {e}"); return None
 
 def parse_stats(text):
     if not text: return None
@@ -177,18 +177,35 @@ def _make_pred(first_n, second_n, label):
     return True
 
 def flush_series(series):
-    """🔥 Прогноз только на последнюю игру серии + 1"""
-    if series["published"]: return  # уже опубликовали для этой серии
+    """ Логика выбора номеров в зависимости от длины серии"""
+    if series["published"]: return
     dis = series["dis"]
-    if len(dis) < 2: return
-    
-    last_di = int(dis[-1])
-    next_di = normalize(last_di + 1)
-    label = f"#N{last_di}/#N{next_di}"
-    
-    if _make_pred(last_di, next_di, label):
+    length = len(dis)
+    if length < 2: return
+
+    # Определяем индексы для прогноза
+    if length == 2:
+        # последний и +1
+        first_n = int(dis[-1])
+        second_n = normalize(first_n + 1)
+    elif length in (3, 4):
+        # 2-й и 3-й (индексы 1 и 2)
+        first_n = int(dis[1])
+        second_n = int(dis[2])
+    elif length == 5:
+        # 3-й и 4-й (индексы 2 и 3)
+        first_n = int(dis[2])
+        second_n = int(dis[3])
+    else:
+        # fallback для длинных серий: предпоследний и последний
+        first_n = int(dis[-2])
+        second_n = int(dis[-1])
+
+    label = f"#N{first_n}/#N{second_n}"
+
+    if _make_pred(first_n, second_n, label):
         series["published"] = True
-        print(f"🚀 ПРОГНОЗ {label} (серия len={len(dis)})")
+        print(f"🚀 ПРОГНОЗ {label} (серия len={length})")
 
 # ==================== ОБРАБОТЧИКИ TELEGRAM ====================
 def process_stats_message(msg):
@@ -206,7 +223,7 @@ def process_stats_message(msg):
 
     pair = di_to_pair.get(num)
     outcome = parse_totals(msg.text)
-    print(f"🔎 ФИНАЛ #N{num} | пара={pair} | тотал={outcome} | #R={has_nat}")
+    print(f" ФИНАЛ #N{num} | пара={pair} | тотал={outcome} | #R={has_nat}")
 
     if pair is not None and outcome:
         record_total(pair, outcome)
@@ -214,7 +231,7 @@ def process_stats_message(msg):
     elif pair is None:
         print(f"⚠️ DB: пара для #N{num} неизвестна")
     elif outcome is None:
-        print(f"⚠️ DB: не удалось распарсить тотал для #N{num}")
+        print(f"️ DB: не удалось распарсить тотал для #N{num}")
 
     # Проверка прогнозов
     with lock:
@@ -222,11 +239,11 @@ def process_stats_message(msg):
             if num in {pred["first_n"], pred["second_n"]} and num not in pred["checked"]:
                 pred["checked"].add(num)
                 if has_nat:
-                    # 🔥 Определяем позицию: 0️⃣ или 1️
+                    # Определяем позицию: 0️⃣ или 1️⃣
                     if num == pred["first_n"]:
-                        pos = "0️⃣0️⃣"
+                        pos = "0️⃣"
                     else:
-                        pos = "0️⃣1️⃣"
+                        pos = "1️⃣"
                     finalize(pred, True, f"{pos} #N{num} → Натурал #R")
                     print(f"🎉 НАТУРАЛ #N{num} ({pos})")
                 elif len(pred["checked"]) >= 2:
@@ -285,7 +302,6 @@ def api_cycle():
             current_series = {"pair": pair, "dis": [di], "published": False}
         current_series["pair"] = pair
 
-        # 🔥 Триггер: публикуем прогноз когда длина серии в наборе
         if len(current_series["dis"]) in SERIES_TRIGGERS and not current_series["published"]:
             flush_series(current_series)
 
@@ -299,7 +315,7 @@ def api_cycle():
 
 def main():
     load_db()
-    print(f"🚀 ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | triggers={sorted(SERIES_TRIGGERS)} | db={DB_PATH}")
+    print(f" ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | triggers={sorted(SERIES_TRIGGERS)} | db={DB_PATH}")
     send_to_channel(f"🟢 <b>Бот запущен</b> | триггеры серии: {sorted(SERIES_TRIGGERS)}")
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
     while True:
