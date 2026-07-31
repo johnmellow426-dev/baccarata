@@ -14,10 +14,16 @@ PREDICTION_CHANNEL_ID   = os.getenv("PREDICTION_CHANNEL_ID")
 MASTI_CHANNEL_ID        = os.getenv("MASTI_CHANNEL_ID")
 STATS_SOURCE_CHANNEL_ID = int(os.getenv("STATS_SOURCE_CHANNEL_ID", "0"))
 
-SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,4,5").split(","))
+SERIES_TRIGGERS= set(int(x) for x in os.getenv("SERIES_TRIGGERS", "2,3,4,5").split(","))
 PRED_TIMEOUT   = int(os.getenv("PRED_TIMEOUT", 720))
 MAX_ACTIVE     = int(os.getenv("MAX_ACTIVE", 10))
-MAX_MAST_ACTIVE= int(os.getenv("MAX_MAST_ACTIVE", 3))  # Лимит активных прогнозов мастей
+
+# Параметры плотного потока генератора (delta ID)
+MIN_DELTA_ID   = int(os.getenv("MIN_DELTA_ID", 100))
+MAX_DELTA_ID   = int(os.getenv("MAX_DELTA_ID", 160))
+
+# Сомнительные окончания game_id, которые нужно пропускать
+FORBIDDEN_ENDINGS = ("62", "73", "51", "84")
 
 API_URL = "https://melbet-2814.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"}
@@ -25,10 +31,10 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 ARROW_CHAR = '\U0001F448'
 
 SUITS_MAP = {
-    0: {"name": "Пики", "symbol": "♠️"},
-    1: {"name": "Трефы", "symbol": "♣️"},
-    2: {"name": "Бубны", "symbol": "♦️"},
-    3: {"name": "Червы", "symbol": "♥️"}
+    1: {"name": "Пики", "symbol": "♠️"},
+    2: {"name": "Трефы", "symbol": "♣️"},
+    3: {"name": "Бубны", "symbol": "♦️"},
+    4: {"name": "Червы", "symbol": "♥️"}
 }
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
@@ -37,9 +43,12 @@ lock = threading.Lock()
 # ==================== СОСТОЯНИЕ ====================
 sent_games   = set()
 active_preds = []
-current_series = {"pair": None, "dis": [], "published": False}
+current_series = {"pair": None, "dis": [], "ids": [], "published": False}
 processed_stats_nums = set()
 mast_preds = {}
+
+# Флаг очереди для мастей (разрешено ли давать следующий прогноз)
+can_predict_masti = True
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
 def normalize(n): 
@@ -54,23 +63,23 @@ def is_final_result(text):
 
 def get_suit_by_id(game_id):
     last_digit = int(str(game_id)[-1])
-    if last_digit % 3 == 0 and last_digit != 0:
-        return 3
-    return last_digit % 3
+    if last_digit in (1, 5, 9):
+        return 1  # ♠️ Пики
+    elif last_digit in (2, 6):
+        return 2  # ♣️ Трефы
+    elif last_digit in (3, 7):
+        return 3  # ♦️ Бубны
+    else: # 4, 8, 0
+        return 4  # ♥️ Червы
 
 def parse_player_suits(text):
-    """
-    Парсит все карты в руке Игрока (первые скобки) и возвращает 
-    множество (set) всех присутствующих мастей с учётом любых кодировок и эмодзи.
-    """
     groups = re.findall(r'\(([^)]*)\)', text or "")
     if not groups: 
         return set()
         
-    player_cards_text = groups[0] # Берем только карты Игрока
+    player_cards_text = groups[0]
     found_suits = set()
     
-    # Проверяем все варианты написания базовых мастей в тексте карт игрока
     if any(s in player_cards_text for s in ['♠', '♠️']): 
         found_suits.add('♠️')
     if any(s in player_cards_text for s in ['♣', '♣️']): 
@@ -137,14 +146,17 @@ def finalize(pred, success, detail):
             active_preds.remove(pred)
 
 def finalize_mast(pred_key, result_text):
-    """Финализация прогноза масти по ключу (display_id первого матча)"""
+    """Финализация прогноза масти и открытие очереди для следующего"""
+    global can_predict_masti
     with lock:
         if pred_key not in mast_preds: return
         pred = mast_preds[pred_key]
         del mast_preds[pred_key]
+        # Разрешаем создавать следующий прогноз после финализации текущего
+        can_predict_masti = True
         
     try:
-        text = f"🎯 Игра #N{pred['first_n']}\nИгрок {pred['suit_symbol']} {result_text}"
+        text = f"🎯 Игра #N{pred['first_n']}\nИгрок {pred['suit_symbol']} {result_text}".strip()
         bot.edit_message_text(chat_id=MASTI_CHANNEL_ID, message_id=pred["msg_id"], text=text)
     except ApiTelegramException as e:
         if "message is not modified" not in e.description and "message to edit not found" not in e.description:
@@ -166,11 +178,23 @@ def _make_pred(first_n, second_n, label):
                              "created_at": time.time(), "label": label})
     return True
 
+# ==================== ЛОГИКА ПРОГНОЗА НАТУРАЛОВ ====================
+def is_hot_stream(id_list):
+    if len(id_list) < 2:
+        return True
+    delta = id_list[-1] - id_list[-2]
+    return MIN_DELTA_ID <= delta <= MAX_DELTA_ID
+
 def flush_series(series):
     if series["published"]: return
     dis = series["dis"]
+    ids = series["ids"]
     length = len(dis)
     if length < 2: return
+
+    if not is_hot_stream(ids):
+        print(f"⚠️ Пропуск серии #N{dis[-1]}: Дельта ID ({ids[-1] - ids[-2]}) вне диапазона [{MIN_DELTA_ID}-{MAX_DELTA_ID}]")
+        return
 
     if length == 2:
         first_n = int(dis[-1])
@@ -188,15 +212,29 @@ def flush_series(series):
     label = f"#N{first_n}/#N{second_n}"
     if _make_pred(first_n, second_n, label):
         series["published"] = True
-        print(f"🚀 ПРОГНОЗ {label} (серия len={length})")
+        delta = ids[-1] - ids[-2] if len(ids) >= 2 else 0
+        print(f"🔥 ГОРАЧИЙ ПОТОК! ПРОГНОЗ {label} (серия len={length}, ΔID={delta})")
 
+# ==================== СОЗДАНИЕ ПРОГНОЗОВ МАСТЕЙ ====================
 def create_mast_prediction(game_id, display_id):
-    """Создаёт прогноз масти с проверкой лимита активных"""
+    """Создаёт прогноз с соблюдением очереди и фильтром сомнительных ID"""
+    global can_predict_masti
+    
+    # 1. Проверка очереди (прогноз каждые 3 игры — ждём закрытия предыдущего)
+    if not can_predict_masti:
+        return
+
+    # 2. Фильтр сомнительных окончаний game_id (62, 73, 51, 84)
+    gid_str = str(game_id)
+    if gid_str.endswith(FORBIDDEN_ENDINGS):
+        print(f"🚫 Пропуск сомнительного ID: {game_id} (оканчивается на {gid_str[-2:]})")
+        return
+
     with lock:
-        if display_id in mast_preds: return
-        if len(mast_preds) >= MAX_MAST_ACTIVE:
-            print(f"⛔ лимит мастей {MAX_MAST_ACTIVE}, пропуск #N{display_id} (активных: {len(mast_preds)})")
+        if display_id in mast_preds: 
             return
+        # Блокируем создание новых прогнозов, пока этот не закроется
+        can_predict_masti = False
     
     suit_code = get_suit_by_id(game_id)
     suit_info = SUITS_MAP[suit_code]
@@ -215,7 +253,11 @@ def create_mast_prediction(game_id, display_id):
                 "checked": set(),
                 "created_at": time.time()
             }
-        print(f"🎯 МАСТЬ #N{display_id} → {suit_info['symbol']} (ID {game_id} mod3={suit_code}) | активных: {len(mast_preds)}")
+        print(f"🎯 МАСТЬ #N{display_id} → {suit_info['symbol']} (ID {game_id}) | Очередь заблокирована до закрытия")
+    else:
+        # Если не удалось отправить, возвращаем возможность дать прогноз
+        with lock:
+            can_predict_masti = True
 
 # ==================== ОБРАБОТЧИКИ TELEGRAM ====================
 def process_stats_message(msg):
@@ -259,21 +301,20 @@ def process_stats_message(msg):
         if num in {pred["first_n"], pred["second_n"]} and num not in pred["checked"]:
             pred["checked"].add(num)
             
-            # Получаем ВСЕ масти с руки Игрока (первые скобки)
             player_suits = parse_player_suits(msg.text)
             
             if player_suits:
-                # Проверяем, есть ли нужная масть ХОТЯ БЫ на одной карте
                 if pred["suit_symbol"] in player_suits:
                     pos = "0️⃣" if num == pred["first_n"] else "1️⃣"
                     finalize_mast(pred_key, f"✅{pos}")
-                    print(f"🎉 МАСТЬ УГАДАНА #N{num} (шаг {pos}) | Масти игрока: {player_suits}")
+                    print(f"🎉 МАСТЬ УГАДАНА #N{num} (шаг {pos}) | Рука: {player_suits}")
                 else:
                     if len(pred["checked"]) >= 2:
-                        finalize_mast(pred_key, "")
+                        # Финализация проигрыша с красным крестом ❌
+                        finalize_mast(pred_key, "❌")
                         print(f"❌ МАСТЬ НЕ УГАДАНА (#N{pred['first_n']}/#N{pred['second_n']})")
                     else:
-                        print(f"⏳ Шаг 0️⃣ (#N{num}) не зашёл (рука: {player_suits}). Ждем 1️⃣ шаг (#N{pred['second_n']})")
+                        print(f"⏳ Шаг 0️⃣ (#N{num}) не зашёл. Ждём 1️⃣ шаг (#N{pred['second_n']})")
             else:
                 print(f"⚠️ Не удалось распарсить карты игрока для #N{num}")
 
@@ -301,7 +342,7 @@ def api_cycle():
                 
         for pred_key, pred in list(mast_preds.items()):
             if time.time() - pred["created_at"] > PRED_TIMEOUT:
-                finalize_mast(pred_key, "⏰")
+                finalize_mast(pred_key, "❌")
                 print(f"⌛ таймаут масти #N{pred_key}")
 
     new_games = []
@@ -322,12 +363,19 @@ def api_cycle():
         gid = game.get("I")
         di = game.get("DI")
         if not di: continue
-        pair = (int(gid) // 100) % 100
+        
+        gid_num = int(gid)
+        pair = (gid_num // 100) % 100
         
         if current_series["pair"] is not None and pair == (current_series["pair"] + 1) % 100:
-            current_series["dis"].append(di)
+            if current_series["ids"] and not (MIN_DELTA_ID <= (gid_num - current_series["ids"][-1]) <= MAX_DELTA_ID):
+                current_series = {"pair": pair, "dis": [di], "ids": [gid_num], "published": False}
+            else:
+                current_series["dis"].append(di)
+                current_series["ids"].append(gid_num)
         else:
-            current_series = {"pair": pair, "dis": [di], "published": False}
+            current_series = {"pair": pair, "dis": [di], "ids": [gid_num], "published": False}
+            
         current_series["pair"] = pair
 
         if len(current_series["dis"]) in SERIES_TRIGGERS and not current_series["published"]:
@@ -340,13 +388,11 @@ def api_cycle():
         sent_games.clear()
 
 def main():
-    print(f"🚀 ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | triggers={sorted(SERIES_TRIGGERS)} | макс. мастей: {MAX_MAST_ACTIVE}")
-    send_to_channel(f"🟢 <b>Бот запущен</b> | триггеры серии: {sorted(SERIES_TRIGGERS)} | макс. мастей: {MAX_MAST_ACTIVE}")
+    print(f"🚀 ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | ΔID=[{MIN_DELTA_ID}-{MAX_DELTA_ID}] | Запрет ID: {FORBIDDEN_ENDINGS}")
+    send_to_channel(f"🟢 <b>Бот запущен</b> | ΔID: [{MIN_DELTA_ID}-{MAX_DELTA_ID}] | Запрет ID: {FORBIDDEN_ENDINGS}")
     
-    # Поток обработчика телеграм-сообщений
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
     
-    # Главный цикл опроса API
     while True:
         try:
             api_cycle()
