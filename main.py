@@ -32,6 +32,31 @@ HEADERS = {
 
 ARROW_CHAR = '\U0001F448'
 
+# ==================== МАППИНГ МАСТЕЙ ====================
+SUIT_MAP = {
+    0: "Черви ❤️",
+    1: "Бубны 🔶",
+    2: "Трефы ♣️",
+    3: "Пики ♠️"
+}
+
+# Текстовые эквиваленты для распознавания масти из поста статистики
+SUIT_KEYWORDS = {
+    "черви": "Черви ❤️",
+    "черва": "Черви ❤️",
+    "❤️": "Черви ❤️",
+    "бубны": "Бубны 🔶",
+    "бубна": "Бубны 🔶",
+    "🔶": "Бубны 🔶",
+    "♦️": "Бубны 🔶",
+    "трефы": "Трефы ♣️",
+    "крести": "Трефы ♣️",
+    "♣️": "Трефы ♣️",
+    "пики": "Пики ♠️",
+    "пика": "Пики ♠️",
+    "♠️": "Пики ♠️"
+}
+
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 lock = threading.Lock()
 
@@ -64,6 +89,15 @@ def get_5th_digit_from_end(gid):
     if len(s) >= 5:
         return int(s[-5])
     return None
+
+
+def calculate_suit(id_value):
+    """Возвращает масть по остатку от деления на 4"""
+    try:
+        val = int(id_value)
+        return SUIT_MAP[val % 4]
+    except (ValueError, TypeError):
+        return None
 
 
 # ==================== API / TG ====================
@@ -107,38 +141,61 @@ def send_prediction(text):
     if not PREDICTION_CHANNEL_ID:
         return None
     try:
-        return bot.send_message(PREDICTION_CHANNEL_ID, text)
+        return bot.send_message(PREDICTION_CHANNEL_ID, text, parse_mode="HTML")
     except Exception as e:
         print(f"⚠️ pred: {e}")
         return None
 
 
 def parse_stats(text):
+    """
+    Парсит номер игры (#N) и выпавшую масть игрока из сообщения канала статистики.
+    """
     if not text:
-        return None
+        return None, None
     m = re.search(r'#N(\d+)', text)
     if not m:
-        return None
-    return int(m.group(1)), bool(re.search(r'#R\b', text))
+        return None, None
+    
+    num = int(m.group(1))
+    found_suit = None
+    
+    text_lower = text.lower()
+    for kw, suit_name in SUIT_KEYWORDS.items():
+        if kw in text_lower:
+            found_suit = suit_name
+            break
+            
+    return num, found_suit
 
 
-def finalize(pred, success, detail):
-    """Финализация прогноза Натуралов с гарантированной очисткой"""
+def finalize_suit_prediction(pred, actual_suit):
+    """Финализация прогноза мастей с раздельным отчетом по GID и DI"""
     try:
-        mark = "✅" if success else "❌"
+        gid_win = (pred["gid_suit"] == actual_suit) if actual_suit else False
+        di_win = (pred["di_suit"] == actual_suit) if actual_suit else False
+        
+        gid_mark = "✅" if gid_win else "❌"
+        di_mark = "✅" if di_win else "❌"
+        
+        status_text = (
+            f"🎯 <b>Прогноз масти | Баккара #N{pred['di']}</b>\n"
+            f"Game ID: {pred['gid']}\n"
+            f"──────────────────────────────\n"
+            f"Выпавшая масть: <b>{actual_suit or 'Не определена'}</b>\n\n"
+            f"1️⃣ <b>По Game ID (%4):</b> {pred['gid_suit']} {gid_mark}\n"
+            f"2️⃣ <b>По Display ID (%4):</b> {pred['di_suit']} {di_mark}"
+        )
+        
         bot.edit_message_text(
             chat_id=PREDICTION_CHANNEL_ID, 
             message_id=pred["msg_id"],
-            text=(
-                f"🎯 Баккара #N{pred['first_n']}\n"
-                f"Возможна Раздача (серия потока)\n"
-                f"Проверка {pred['label']}\n"
-                f"{mark} {detail}"
-            )
+            text=status_text,
+            parse_mode="HTML"
         )
     except ApiTelegramException as e:
         print(f"⚠️ edit err: {e.description}")
-    except Exception as e: 
+        except Exception as e: 
         print(f"⚠️ edit: {e}")
     finally:
         with lock:
@@ -146,17 +203,24 @@ def finalize(pred, success, detail):
                 active_preds.remove(pred)
 
 
-def _make_pred(first_n, second_n, label):
+def _make_pred(gid, di):
+    """Создает двойной прогноз по масти на основе GID % 4 и DI % 4"""
     with lock:
         if len(active_preds) >= MAX_ACTIVE:
-            print(f"⛔ лимит {MAX_ACTIVE}, пропуск {label}")
+            print(f"⛔ лимит {MAX_ACTIVE}, пропуск прогноза масти")
             return False
             
+    gid_suit = calculate_suit(gid)
+    di_suit = calculate_suit(di)
+    
     text = (
-        f"🎯 Баккара #N{first_n}\n"
-        f"Возможна Раздача (серия потока)\n"
-        f"Проверка {label}\n"
-        f"⏳ Ожидание #R..."
+        f"🎯 <b>Прогноз масти 1-й карты Игрока</b>\n"
+        f"Игра: #N{di} (GID: {gid})\n"
+        f"──────────────────────────────\n"
+        f"1️⃣ <b>По Game ID (%4):</b> {gid_suit}\n"
+        f"2️⃣ <b>По Display ID (%4):</b> {di_suit}\n"
+        f"──────────────────────────────\n"
+        f"⏳ Ожидание результата..."
     )
     sent = send_prediction(text)
     if not sent:
@@ -165,11 +229,11 @@ def _make_pred(first_n, second_n, label):
     with lock:
         active_preds.append({
             "msg_id": sent.message_id,
-            "first_n": first_n,
-            "second_n": second_n,
-            "checked": set(),
-            "created_at": time.time(),
-            "label": label
+            "gid": gid,
+            "di": di,
+            "gid_suit": gid_suit,
+            "di_suit": di_suit,
+            "created_at": time.time()
         })
     return True
 
@@ -178,38 +242,27 @@ def _make_pred(first_n, second_n, label):
 def process_stats_message(msg):
     if msg.chat.id != STATS_SOURCE_CHANNEL_ID:
         return
-    parsed = parse_stats(msg.text)
-    if not parsed:
+    num, actual_suit = parse_stats(msg.text)
+    if not num:
         return
-    num, has_nat = parsed
 
     if num in processed_stats_nums:
         return
 
     if not is_final_result(msg.text):
-        if ARROW_CHAR in msg.text:
-            print(f"⏳ промежуточный #N{num} (стрелка), пропускаем")
-        else:
-            print(f"⏳ промежуточный #N{num}, текст: {msg.text[:100]!r}")
         return
 
     processed_stats_nums.add(num)
-    print(f"🔎 ФИНАЛ #N{num} | #R={has_nat}")
+    print(f"🔎 ФИНАЛ #N{num} | Масть: {actual_suit}")
 
-    # Проверка прогнозов Натуралов
+    # Проверка активных прогнозов по номеру Display ID (di) или Game ID (gid)
     with lock:
         preds_to_check = list(active_preds)
         
     for pred in preds_to_check:
-        if num in {pred["first_n"], pred["second_n"]} and num not in pred["checked"]:
-            pred["checked"].add(num)
-            if has_nat:
-                pos = "0️⃣" if num == pred["first_n"] else "1️⃣"
-                finalize(pred, True, f"{pos} #N{num} → Натурал #R")
-                print(f"🎉 НАТУРАЛ #N{num} ({pos})")
-            elif len(pred["checked"]) >= 2:
-                finalize(pred, False, "❌ не зашло")
-                print(f"❌ нет #R в {pred['label']}")
+        if num in (pred["di"], pred["gid"]):
+            finalize_suit_prediction(pred, actual_suit)
+            print(f"🎉 Прогноз для #N{num} финализирован! Фактическая масть: {actual_suit}")
 
 
 @bot.channel_post_handler()
@@ -238,7 +291,7 @@ def api_cycle():
     with lock:
         for pred in list(active_preds):
             if time.time() - pred["created_at"] > PRED_TIMEOUT:
-                finalize(pred, False, "⌛ таймаут ожидания #R")
+                finalize_suit_prediction(pred, None)
 
     new_games = []
     for game in games:
@@ -270,12 +323,8 @@ def api_cycle():
                 delta = gid_num - last_processed_gid
                 # Проверка плотности потока Баккары
                 if MIN_DELTA_ID <= delta <= MAX_DELTA_ID:
-                    first_n = di_num
-                    second_n = normalize(first_n + 1)
-                    label = f"#N{first_n}/#N{second_n}"
-                    
-                    if _make_pred(first_n, second_n, label):
-                        print(f"🔥 БАККАРА: Изменение цифры ({last_digit_5th} ➔ {current_5th})! Прогноз {label} (ΔID={delta})")
+                    if _make_pred(gid_num, di_num):
+                        print(f"🔥 БАККАРА: Прогноз масти отправлен для #N{di_num} (GID: {gid_num})")
                 else:
                     print(f"⚠️ [Баккара] Цифра изменилась ({last_digit_5th} ➔ {current_5th}), но дельта ID ({delta}) вне [{MIN_DELTA_ID}-{MAX_DELTA_ID}]")
 
@@ -290,8 +339,8 @@ def api_cycle():
 
 
 def main():
-    print(f"🚀 ЗАПУСК БОТА (ТОЛЬКО БАККАРА | SI={BACCARAT_SPORT_ID}) | ΔID=[{MIN_DELTA_ID}-{MAX_DELTA_ID}]")
-    send_to_channel("🟢 <b>Бот запущен</b> | Отслеживание смены 5-й цифры ID (ТОЛЬКО Баккара)")
+    print(f"🚀 ЗАПУСК БОТА (ПРОГНОЗ МАСТЕЙ GID % 4 И DI % 4) | ΔID=[{MIN_DELTA_ID}-{MAX_DELTA_ID}]")
+    send_to_channel("🟢 <b>Бот запущен</b> | Отслеживание и двойная проверка мастей (Game ID % 4 и Display ID % 4)")
     
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
     
