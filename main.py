@@ -8,20 +8,24 @@ import telebot
 from telebot.apihelper import ApiTelegramException
 
 # ==================== НАСТРОЙКИ (ENV) ====================
-BOT_TOKEN               = os.getenv("BOT_TOKEN")
-CHANNEL_ID              = os.getenv("CHANNEL_ID")
-PREDICTION_CHANNEL_ID   = os.getenv("PREDICTION_CHANNEL_ID")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+PREDICTION_CHANNEL_ID = os.getenv("PREDICTION_CHANNEL_ID")
 STATS_SOURCE_CHANNEL_ID = int(os.getenv("STATS_SOURCE_CHANNEL_ID", "0"))
 
-PRED_TIMEOUT   = int(os.getenv("PRED_TIMEOUT", 720))
-MAX_ACTIVE     = int(os.getenv("MAX_ACTIVE", 10))
+PRED_TIMEOUT = int(os.getenv("PRED_TIMEOUT", 720))
+MAX_ACTIVE = int(os.getenv("MAX_ACTIVE", 10))
 
 # Параметры плотного потока генератора (delta ID)
-MIN_DELTA_ID   = int(os.getenv("MIN_DELTA_ID", 110))
-MAX_DELTA_ID   = int(os.getenv("MAX_DELTA_ID", 160))
+MIN_DELTA_ID = int(os.getenv("MIN_DELTA_ID", 110))
+MAX_DELTA_ID = int(os.getenv("MAX_DELTA_ID", 160))
 
-API_URL = "https://melbet-2814.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json"}
+# Актуальная ссылка с поддержкой Баккары (sports=146,236)
+API_URL = "https://melbet-0018.pro/service-api/LiveFeed/Get1x2_VZip?sports=146,236&champs=1643503,2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json"
+}
 
 ARROW_CHAR = '\U0001F448'
 
@@ -29,17 +33,19 @@ bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 lock = threading.Lock()
 
 # ==================== СОСТОЯНИЕ ====================
-sent_games           = set()
-active_preds         = []
+sent_games = set()
+active_preds = []
 processed_stats_nums = set()
 
 # Состояние для отслеживания смены 5-й цифры
-last_processed_gid   = None
-last_digit_5th       = None
+last_processed_gid = None
+last_digit_5th = None
+
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
 def normalize(n): 
     return ((n - 1) % 1440) + 1
+
 
 def is_final_result(text):
     if not text: 
@@ -48,6 +54,7 @@ def is_final_result(text):
         return False
     return True
 
+
 def get_5th_digit_from_end(gid):
     """Возвращает 5-ю цифру с конца у game_id"""
     s = str(gid)
@@ -55,46 +62,75 @@ def get_5th_digit_from_end(gid):
         return int(s[-5])
     return None
 
+
 # ==================== API / TG ====================
 def fetch_data():
     try:
         resp = requests.get(API_URL, headers=HEADERS, timeout=10)
-        if resp.status_code == 200: return resp.json().get("Value", [])
-    except Exception as e: print(f"⚠️ API: {e}")
+        if resp.status_code == 200:
+            return resp.json().get("Value", [])
+    except Exception as e:
+        print(f"⚠️ API: {e}")
     return []
+
 
 def format_game_info(game):
     try:
+        g_i = game.get('I', 'N/A')
+        g_di = game.get('DI', 'N/A')
         return (
-            f"🎮 ИГРА #N{game.get('I','N/A')}   Display ID: {game.get('DI','N/A')}\n"
-            f"──────────────────────────────\n")
+            f"🎮 ИГРА #N{g_i}    Display ID: {g_di}\n"
+            f"──────────────────────────────\n"
+        )
     except Exception as e:
-        print(f"⚠️ fmt: {e}"); return None
+        print(f"⚠️ fmt: {e}")
+        return None
+
 
 def send_to_channel(text):
-    if not CHANNEL_ID: return False
-    try: bot.send_message(CHANNEL_ID, text, parse_mode="HTML"); return True
-    except Exception as e: print(f"⚠️ send: {e}"); return False
+    if not CHANNEL_ID:
+        return False
+    try:
+        bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+        return True
+    except Exception as e:
+        print(f"⚠️ send: {e}")
+        return False
+
 
 def send_prediction(text):
-    if not PREDICTION_CHANNEL_ID: return None
-    try: return bot.send_message(PREDICTION_CHANNEL_ID, text)
-    except Exception as e: print(f"⚠️ pred: {e}"); return None
+    if not PREDICTION_CHANNEL_ID:
+        return None
+    try:
+        return bot.send_message(PREDICTION_CHANNEL_ID, text)
+    except Exception as e:
+        print(f"⚠️ pred: {e}")
+        return None
+
 
 def parse_stats(text):
-    if not text: return None
+    if not text:
+        return None
     m = re.search(r'#N(\d+)', text)
-    if not m: return None
+    if not m:
+        return None
     return int(m.group(1)), bool(re.search(r'#R\b', text))
+
 
 def finalize(pred, success, detail):
     """Финализация прогноза Натуралов с гарантированной очисткой"""
     try:
         mark = "✅" if success else "❌"
         bot.edit_message_text(
-            chat_id=PREDICTION_CHANNEL_ID, message_id=pred["msg_id"],
-            text=(f"🎯 Игра #N{pred['first_n']}\nВозможна Раздача (серия потока)\n"
-                  f"проверка {pred['label']}\n{mark} {detail}"))
+            chat_id=PREDICTION_CHANNEL_ID, 
+            message_id=pred["msg_id"],
+            text=(
+                f"🎯 Игра #N{pred['first_n']}\n"
+                f"Возможна Раздача (серия потока)\n"
+                f"проверка {pred['label']}\n"
+                f"{mark} {detail}"
+            )
+        )
     except ApiTelegramException as e:
         print(f"⚠️ edit err: {e.description}")
     except Exception as e: 
@@ -104,28 +140,46 @@ def finalize(pred, success, detail):
             if pred in active_preds: 
                 active_preds.remove(pred)
 
+
 def _make_pred(first_n, second_n, label):
     with lock:
         if len(active_preds) >= MAX_ACTIVE:
-            print(f"⛔ лимит {MAX_ACTIVE}, пропуск {label}"); return False
-    text = (f"🎯 Игра #N{first_n}\nВозможна Раздача (серия потока)\n"
-            f"проверка {label}\n⏳ Ожидание #R...")
+            print(f"⛔ лимит {MAX_ACTIVE}, пропуск {label}")
+            return False
+            
+    text = (
+        f"🎯 Игра #N{first_n}\n"
+        f"Возможна Раздача (серия потока)\n"
+        f"проверка {label}\n"
+        f"⏳ Ожидание #R..."
+    )
     sent = send_prediction(text)
-    if not sent: return False
+    if not sent:
+        return False
+        
     with lock:
-        active_preds.append({"msg_id": sent.message_id, "first_n": first_n,
-                             "second_n": second_n, "checked": set(),
-                             "created_at": time.time(), "label": label})
+        active_preds.append({
+            "msg_id": sent.message_id,
+            "first_n": first_n,
+            "second_n": second_n,
+            "checked": set(),
+            "created_at": time.time(),
+            "label": label
+        })
     return True
+
 
 # ==================== ОБРАБОТЧИКИ TELEGRAM ====================
 def process_stats_message(msg):
-    if msg.chat.id != STATS_SOURCE_CHANNEL_ID: return
+    if msg.chat.id != STATS_SOURCE_CHANNEL_ID:
+        return
     parsed = parse_stats(msg.text)
-    if not parsed: return
+    if not parsed:
+        return
     num, has_nat = parsed
 
-    if num in processed_stats_nums: return
+    if num in processed_stats_nums:
+        return
 
     if not is_final_result(msg.text):
         if ARROW_CHAR in msg.text:
@@ -152,21 +206,25 @@ def process_stats_message(msg):
                 finalize(pred, False, "❌ не зашло")
                 print(f"❌ нет #R в {pred['label']}")
 
+
 @bot.channel_post_handler()
 def on_stats(msg):
     print(f"📨 POST chat.id={msg.chat.id} | {(msg.text or '')[:80]!r}")
     process_stats_message(msg)
+
 
 @bot.edited_channel_post_handler()
 def on_stats_edited(msg):
     print(f"✏️ EDITED POST chat.id={msg.chat.id} | {(msg.text or '')[:80]!r}")
     process_stats_message(msg)
 
+
 # ==================== ГЛАВНЫЙ ЦИКЛ ====================
 def api_cycle():
     global last_processed_gid, last_digit_5th
     games = fetch_data()
-    if not games: return
+    if not games:
+        return
 
     # Проверка таймаутов
     with lock:
@@ -178,18 +236,21 @@ def api_cycle():
     for game in games:
         gid = game.get("I")
         di = game.get("DI")
-        if not gid or gid in sent_games: continue
+        if not gid or gid in sent_games:
+            continue
         sent_games.add(gid)
         new_games.append(game)
         text = format_game_info(game)
-        if text: send_to_channel(text)
+        if text:
+            send_to_channel(text)
             
     new_games.sort(key=lambda g: int(g.get("DI") or 0))
 
     for game in new_games:
         gid = game.get("I")
         di = game.get("DI")
-        if not di or not gid: continue
+        if not di or not gid:
+            continue
         
         gid_num = int(gid)
         di_num = int(di)
@@ -219,9 +280,10 @@ def api_cycle():
     if len(sent_games) > 300: 
         sent_games.clear()
 
+
 def main():
     print(f"🚀 ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | ΔID=[{MIN_DELTA_ID}-{MAX_DELTA_ID}]")
-    send_to_channel(f"🟢 <b>Бот запущен</b> | Отслеживание смены 5-й цифры ID")
+    send_to_channel("🟢 <b>Бот запущен</b> | Отслеживание смены 5-й цифры ID (Баккара + 21)")
     
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
     
@@ -232,6 +294,7 @@ def main():
         except Exception as e:
             print(f"⚠️ ошибка цикла: {e}")
             time.sleep(30)
+
 
 if __name__ == "__main__":
     main()
