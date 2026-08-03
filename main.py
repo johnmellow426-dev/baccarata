@@ -195,7 +195,7 @@ def finalize_suit_prediction(pred, actual_suit):
         )
     except ApiTelegramException as e:
         print(f"⚠️ edit err: {e.description}")
-        except Exception as e: 
+    except Exception as e:
         print(f"⚠️ edit: {e}")
     finally:
         with lock:
