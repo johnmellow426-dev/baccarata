@@ -17,10 +17,13 @@ PRED_TIMEOUT = int(os.getenv("PRED_TIMEOUT", 720))
 MAX_ACTIVE = int(os.getenv("MAX_ACTIVE", 10))
 
 # Параметры плотного потока генератора (delta ID)
-MIN_DELTA_ID = int(os.getenv("MIN_DELTA_ID", 110))
-MAX_DELTA_ID = int(os.getenv("MAX_DELTA_ID", 160))
+MIN_DELTA_ID = int(os.getenv("MIN_DELTA_ID", 100))
+MAX_DELTA_ID = int(os.getenv("MAX_DELTA_ID", 140))
 
-# Актуальная ссылка с поддержкой Баккары (sports=146,236)
+# ID Спорта для Баккары
+BACCARAT_SPORT_ID = 236
+
+# Ссылка на API
 API_URL = "https://melbet-0018.pro/service-api/LiveFeed/Get1x2_VZip?sports=146,236&champs=1643503,2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -78,8 +81,10 @@ def format_game_info(game):
     try:
         g_i = game.get('I', 'N/A')
         g_di = game.get('DI', 'N/A')
+        sport_name = game.get('SN', 'Баккара')
         return (
-            f"🎮 ИГРА #N{g_i}    Display ID: {g_di}\n"
+            f"🎴 <b>{sport_name}</b> | ИГРА #N{g_i}\n"
+            f"Display ID: {g_di}\n"
             f"──────────────────────────────\n"
         )
     except Exception as e:
@@ -125,9 +130,9 @@ def finalize(pred, success, detail):
             chat_id=PREDICTION_CHANNEL_ID, 
             message_id=pred["msg_id"],
             text=(
-                f"🎯 Игра #N{pred['first_n']}\n"
+                f"🎯 Баккара #N{pred['first_n']}\n"
                 f"Возможна Раздача (серия потока)\n"
-                f"проверка {pred['label']}\n"
+                f"Проверка {pred['label']}\n"
                 f"{mark} {detail}"
             )
         )
@@ -148,9 +153,9 @@ def _make_pred(first_n, second_n, label):
             return False
             
     text = (
-        f"🎯 Игра #N{first_n}\n"
+        f"🎯 Баккара #N{first_n}\n"
         f"Возможна Раздача (серия потока)\n"
-        f"проверка {label}\n"
+        f"Проверка {label}\n"
         f"⏳ Ожидание #R..."
     )
     sent = send_prediction(text)
@@ -222,9 +227,12 @@ def on_stats_edited(msg):
 # ==================== ГЛАВНЫЙ ЦИКЛ ====================
 def api_cycle():
     global last_processed_gid, last_digit_5th
-    games = fetch_data()
-    if not games:
+    raw_games = fetch_data()
+    if not raw_games:
         return
+
+    # 🎯 ФИЛЬТРАЦИЯ: Оставляем ИСКЛЮЧИТЕЛЬНО игры Баккары (SI == 236)
+    games = [g for g in raw_games if g.get("SI") == BACCARAT_SPORT_ID]
 
     # Проверка таймаутов
     with lock:
@@ -260,30 +268,30 @@ def api_cycle():
             # Условие: 5-я цифра с конца увеличилась строго на 1 (с учётом перехода 9 -> 0)
             if current_5th == (last_digit_5th + 1) % 10:
                 delta = gid_num - last_processed_gid
-                # Дополнительная проверка, что поток плотный
+                # Проверка плотности потока Баккары
                 if MIN_DELTA_ID <= delta <= MAX_DELTA_ID:
                     first_n = di_num
                     second_n = normalize(first_n + 1)
                     label = f"#N{first_n}/#N{second_n}"
                     
                     if _make_pred(first_n, second_n, label):
-                        print(f"🔥 ИЗМЕНЕНИЕ ЦИФРЫ ({last_digit_5th} ➔ {current_5th})! Сформирован прогноз {label} (ΔID={delta})")
+                        print(f"🔥 БАККАРА: Изменение цифры ({last_digit_5th} ➔ {current_5th})! Прогноз {label} (ΔID={delta})")
                 else:
-                    print(f"⚠️ Цифра изменилась ({last_digit_5th} ➔ {current_5th}), но дельта ID ({delta}) вне [{MIN_DELTA_ID}-{MAX_DELTA_ID}]")
+                    print(f"⚠️ [Баккара] Цифра изменилась ({last_digit_5th} ➔ {current_5th}), но дельта ID ({delta}) вне [{MIN_DELTA_ID}-{MAX_DELTA_ID}]")
 
         last_processed_gid = gid_num
         last_digit_5th = current_5th
 
     if new_games:
-        print(f"✅ Новых игр: {len(new_games)} | Последняя 5-я цифра: {last_digit_5th}")
+        print(f"✅ Новых игр Баккары: {len(new_games)} | Последняя 5-я цифра: {last_digit_5th}")
         
     if len(sent_games) > 300: 
         sent_games.clear()
 
 
 def main():
-    print(f"🚀 ЗАПУСК | STATS_ID={STATS_SOURCE_CHANNEL_ID} | ΔID=[{MIN_DELTA_ID}-{MAX_DELTA_ID}]")
-    send_to_channel("🟢 <b>Бот запущен</b> | Отслеживание смены 5-й цифры ID (Баккара + 21)")
+    print(f"🚀 ЗАПУСК БОТА (ТОЛЬКО БАККАРА | SI={BACCARAT_SPORT_ID}) | ΔID=[{MIN_DELTA_ID}-{MAX_DELTA_ID}]")
+    send_to_channel("🟢 <b>Бот запущен</b> | Отслеживание смены 5-й цифры ID (ТОЛЬКО Баккара)")
     
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
     
