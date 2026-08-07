@@ -24,7 +24,7 @@ MAX_DELTA_ID = int(os.getenv("MAX_DELTA_ID", 140))
 BACCARAT_SPORT_ID = 236
 
 # Ссылка на API
-API_URL = "https://melbet-0018.pro/service-api/LiveFeed/Get1x2_VZip?sports=146,236&champs=1643503,2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
+API_URL = "https://melbet-4866.pro/service-api/LiveFeed/Get1x2_VZip?sports=146,236&champs=1643503,2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json"
