@@ -1,258 +1,192 @@
 import os
 import time
-import json
+import re
+import threading
 import requests
 import telebot
+from telebot.apihelper import ApiTelegramException
 
-# --- НАСТРОЙКИ ОКРУЖЕНИЯ ---
+# ==================== НАСТРОЙКИ (ENV) ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+PREDICTION_CHANNEL_ID = os.getenv("PREDICTION_CHANNEL_ID")
 
-BASE_DOMAIN = os.getenv("BASE_DOMAIN", "melbet-4866.pro")
+# Новые границы разницы последних 3-х цифр ID
+MIN_DELTA_3D = int(os.getenv("MIN_DELTA_3D", 200))
+MAX_DELTA_3D = int(os.getenv("MAX_DELTA_3D", 600))
 
-# URL API LiveFeed для Баккары (sports=236)
-VIRTUAL_URL = os.getenv(
-    "VIRTUAL_URL",
-    f"https://{BASE_DOMAIN}/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
-)
-STATISTIC_URL_TEMPLATE = os.getenv(
-    "STATISTIC_URL_TEMPLATE",
-    f"https://{BASE_DOMAIN}/cyber-api/mainfeedlive/web/cyber/v3/statistic?country=192&fcountry=192&gameId={{game_id}}&gr=1521&lng=ru&ref=8"
-)
+# ID Спорта для Баккары
+BACCARAT_SPORT_ID = 236
+
+# Ссылка на API
+API_URL = "https://melbet-4866.pro/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json"
+}
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
+lock = threading.Lock()
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Referer": f"https://{BASE_DOMAIN}/",
-}
-
-# --- КОНСТАНТЫ И МАППИНГ ---
-SUITS = {
-    0: "♠️",
-    1: "♣️",
-    2: "♦️",
-    3: "♥️"
-}
-
-CARD_VALUES = {
-    1: "A", 14: "A",
-    2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9", 10: "10",
-    11: "J", 12: "Q", 13: "K"
-}
-
-active_games = {}
+# ==================== СОСТОЯНИЕ ====================
+sent_games = set()
+last_processed_gid = None
 
 
-# ============================================================
-#   ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================================
-
-def extract_game_number(game_data):
-    """Извлекает номер раунда (DI) из JSON."""
-    tn_val = game_data.get("DI") or game_data.get("TN")
-
-    if not tn_val or not str(tn_val).isdigit():
-        sc = game_data.get("SC", {})
-        tn_val = sc.get("DI") or sc.get("CP")
-
-    if tn_val is not None:
-        try:
-            return int(tn_val)
-        except (ValueError, TypeError):
-            pass
-
-    return 0
-
-
-def get_card_symbol(card_value, suit_code):
-    val_str = CARD_VALUES.get(card_value, "?")
-    suit_str = SUITS.get(suit_code, "?")
-    return f"{val_str}{suit_str}"
-
-
-def parse_cards_detail(cards_str):
-    """Разбирает список карт из JSON статистики."""
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+def get_last_3_digits(gid):
+    """Возвращает последние 3 цифры Game ID как число"""
     try:
-        if isinstance(cards_str, list):
-            cards = cards_str
-        else:
-            cards = json.loads(cards_str)
-            
-        symbols = []
-        for c in cards:
-            cv, cs = c.get("CV", 0), c.get("CS", 0)
-            symbols.append(get_card_symbol(cv, cs))
-        return symbols
-    except Exception:
-        return []
+        return int(str(gid)[-3:])
+    except (ValueError, TypeError):
+        return None
 
 
-def get_active_games_info(session):
-    try:
-        resp = session.get(VIRTUAL_URL, headers=HEADERS, timeout=10)
-        data = resp.json()
+def calculate_delta_3d(prev_gid, curr_gid):
+    """Вычисляет разницу последних 3-х цифр с учетом возможного перехода через 1000"""
+    prev_3d = get_last_3_digits(prev_gid)
+    curr_3d = get_last_3_digits(curr_gid)
+    
+    if prev_3d is None or curr_3d is None:
+        return None
         
-        raw_games = data.get("Value", []) or data.get("games", [])
-        if isinstance(raw_games, dict):
-            raw_games = [raw_games]
+    delta = curr_3d - prev_3d
+    if delta < 0:
+        delta += 1000
+    return delta
 
-        result = []
-        for idx, g in enumerate(raw_games):
-            game_id = g.get("I") or g.get("id")
-            if not game_id:
-                continue
 
-            sc = g.get("SC", {}) or g.get("scores", {})
-            is_finished = (sc.get("CPS") == "Игра завершена") or (sc.get("currentPeriodName") == "Игра завершена")
-
-            result.append({
-                "id": game_id,
-                "index": idx,
-                "is_finished": is_finished,
-                "raw_data": g
-            })
-            
-        return result
+# ==================== API / TG ====================
+def fetch_data():
+    try:
+        resp = requests.get(API_URL, headers=HEADERS, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("Value", [])
     except Exception as e:
-        print(f"❌ Ошибка получения списка игр Баккары: {e}")
-        return []
+        print(f"⚠️ API: {e}")
+    return []
 
 
-# ============================================================
-#   ОСНОВНОЙ ЦИКЛ
-# ============================================================
+def format_game_info(game):
+    try:
+        g_i = game.get('I', 'N/A')
+        g_di = game.get('DI', 'N/A')
+        sport_name = game.get('SN', 'Баккара')
+        return (
+            f"🎴 <b>{sport_name}</b> | ИГРА #N{g_i}\n"
+            f"Display ID: {g_di}\n"
+            f"──────────────────────────────\n"
+        )
+    except Exception as e:
+        print(f"⚠️ fmt: {e}")
+        return None
+
+
+def send_to_channel(text):
+    if not CHANNEL_ID:
+        return False
+    try:
+        bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+        return True
+    except Exception as e:
+        print(f"⚠️ send: {e}")
+        return False
+
+
+def send_prediction(text):
+    if not PREDICTION_CHANNEL_ID:
+        return None
+    try:
+        return bot.send_message(PREDICTION_CHANNEL_ID, text, parse_mode="HTML")
+    except Exception as e:
+        print(f"⚠️ pred: {e}")
+        return None
+
+
+def _make_pred(di_num, delta):
+    """Формирует и отправляет прогноз на текущую и следующую раздачу"""
+    next_di_num = di_num + 1
+    
+    text = (
+        f"🔥 <b>СИГНАЛ | БАККАРА</b>\n"
+        f"──────────────────────────────\n"
+        f"🎯 <b>Ожидаются игры:</b> #N{di_num} - #N{next_di_num}\n"
+        f"📊 <b>Разница 3-х цифр ID:</b> {delta} (в интервале 200-600)\n"
+        f"──────────────────────────────\n"
+        f"⏳ <i>Вход на 1-2 шага (догон)</i>"
+    )
+    
+    sent = send_prediction(text)
+    return bool(sent)
+
+
+# ==================== ГЛАВНЫЙ ЦИКЛ ====================
+def api_cycle():
+    global last_processed_gid
+    raw_games = fetch_data()
+    if not raw_games:
+        return
+
+    # Фильтрация исключительно на Баккару (SI == 236)
+    games = [g for g in raw_games if g.get("SI") == BACCARAT_SPORT_ID]
+
+    new_games = []
+    for game in games:
+        gid = game.get("I")
+        if not gid or gid in sent_games:
+            continue
+        sent_games.add(gid)
+        new_games.append(game)
+        
+        text = format_game_info(game)
+        if text:
+            send_to_channel(text)
+            
+    # Сортировка по возрастанию Display ID
+    new_games.sort(key=lambda g: int(g.get("DI") or 0))
+
+    for game in new_games:
+        gid = game.get("I")
+        di = game.get("DI")
+        if not di or not gid:
+            continue
+        
+        gid_num = int(gid)
+        di_num = int(di)
+
+        if last_processed_gid is not None:
+            # Вычисляем разницу последних 3-х цифр ID
+            delta_3d = calculate_delta_3d(last_processed_gid, gid_num)
+            
+            if delta_3d is not None:
+                if MIN_DELTA_3D <= delta_3d <= MAX_DELTA_3D:
+                    if _make_pred(di_num, delta_3d):
+                        print(f"🔥 БАККАРА: Прогноз отправлен на игры #N{di_num}-#N{di_num + 1} (Δ3D: {delta_3d})")
+                else:
+                    print(f"ℹ️ [Баккара] #N{di_num} Δ3D={delta_3d} вне интервала [{MIN_DELTA_3D}-{MAX_DELTA_3D}]")
+
+        last_processed_gid = gid_num
+
+    if new_games:
+        print(f"✅ Обработано новых игр Баккары: {len(new_games)} | Последний GID: {last_processed_gid}")
+        
+    if len(sent_games) > 300: 
+        sent_games.clear()
+
 
 def main():
-    global active_games
-    print("🚀 Запуск бота трансляции Баккары...")
-    session = requests.Session()
-
+    print(f"🚀 ЗАПУСК БОТА (СИГНАЛЫ РАЗНИЦЫ 3-х ЦИФР ID: {MIN_DELTA_3D}-{MAX_DELTA_3D})")
+    send_to_channel("🟢 <b>Бот запущен</b> | Анализ разницы 3х цифр ID для прогноза раздач")
+    
+    threading.Thread(target=bot.infinity_polling, daemon=True).start()
+    
     while True:
         try:
-            games_info = get_active_games_info(session)
-            if not games_info:
-                time.sleep(3)
-                continue
-
-            current_game_ids = set(g["id"] for g in games_info if g["id"])
-
-            for g_info in games_info:
-                game_id = g_info["id"]
-                if not game_id:
-                    continue
-
-                # 1. АНОНС НОВОЙ ИГРЫ
-                if game_id not in active_games:
-                    game_num = extract_game_number(g_info["raw_data"])
-                    announcement_text = f"🎴 <b>Баккара #N{game_num}</b>\n⏳ Ожидание начала... (ID: {game_id})"
-                    
-                    msg_id = None
-                    if CHANNEL_ID:
-                        try:
-                            sent = bot.send_message(CHANNEL_ID, announcement_text, parse_mode="HTML")
-                            msg_id = sent.message_id
-                            print(f"📡 Анонс игры Баккара #N{game_num} (ID: {game_id})")
-                        except Exception as e:
-                            print(f"⚠️ Ошибка отправки анонса #N{game_num}: {e}")
-
-                    active_games[game_id] = {
-                        "message_id": msg_id,
-                        "game_num": game_num,
-                        "last_state": "",
-                        "is_finished": False
-                    }
-
-                slot = active_games[game_id]
-                game_num = slot["game_num"]
-
-                # 2. ПОЛУЧЕНИЕ СТАТИСТИКИ ХОДА ИГРЫ
-                stat_url = STATISTIC_URL_TEMPLATE.format(game_id=game_id)
-                resp = session.get(stat_url, headers=HEADERS, timeout=5)
-                if resp.status_code == 200 and resp.text.strip():
-                    data = resp.json()
-                    score_detail = data.get("fullScoreDetail", {})
-                    
-                    # Очки Игрока (P1) и Банкира (P2) в Баккаре
-                    p1_score = score_detail.get("scoreOpp1", 0)
-                    p2_score = score_detail.get("scoreOpp2", 0)
-                    status = data.get("currentPeriodName", "")
-
-                    stat = data.get("statistic", {}).get("main", {})
-                    p1_cards = parse_cards_detail(stat.get("P1", "[]"))
-                    p2_cards = parse_cards_detail(stat.get("P2", "[]"))
-
-                    is_finished = (status == "Игра завершена")
-
-                    # 3. ФОРМИРОВАНИЕ СООБЩЕНИЯ
-                    current_state = f"{p1_score}_{p2_score}_{'_'.join(p1_cards)}_{'_'.join(p2_cards)}_{is_finished}"
-
-                    if current_state != slot["last_state"] and (p1_cards or p2_cards):
-                        str_p1_cards = " ".join(p1_cards) if p1_cards else "—"
-                        str_p2_cards = " ".join(p2_cards) if p2_cards else "—"
-
-                        if not is_finished:
-                            msg = (
-                                f"🎴 <b>Баккара #N{game_num}</b>\n"
-                                f"──────────────────────────────\n"
-                                f"🔵 <b>Игрок:</b> {p1_score} очк. [{str_p1_cards}]\n"
-                                f"🔴 <b>Банкир:</b> {p2_score} очк. [{str_p2_cards}]\n"
-                                f"──────────────────────────────\n"
-                                f"⏳ <i>Раунд в процессе...</i>\n"
-                                f"(ID: {game_id})"
-                            )
-                        else:
-                            # Определение победителя в Баккаре
-                            if p1_score > p2_score:
-                                winner_str = "🏆 <b>Победа: ИГРОК 🔵</b>"
-                            elif p2_score > p1_score:
-                                winner_str = "🏆 <b>Победа: БАНКИР 🔴</b>"
-                            else:
-                                winner_str = "🤝 <b>НИЧЬЯ 🟡</b>"
-
-                            msg = (
-                                f"🎴 <b>Баккара #N{game_num} | ИТОГ</b>\n"
-                                f"──────────────────────────────\n"
-                                f"🔵 <b>Игрок:</b> {p1_score} очк. [{str_p1_cards}]\n"
-                                f"🔴 <b>Банкир:</b> {p2_score} очк. [{str_p2_cards}]\n"
-                                f"──────────────────────────────\n"
-                                f"{winner_str}\n"
-                                f"(ID: {game_id})"
-                            )
-
-                        try:
-                            if slot["message_id"] and CHANNEL_ID:
-                                bot.edit_message_text(
-                                    chat_id=CHANNEL_ID,
-                                    message_id=slot["message_id"],
-                                    text=msg,
-                                    parse_mode="HTML"
-                                )
-                            elif CHANNEL_ID:
-                                sent = bot.send_message(CHANNEL_ID, msg, parse_mode="HTML")
-                                slot["message_id"] = sent.message_id
-                        except Exception as e:
-                            print(f"⚠️ Ошибка обновления сообщения в Telegram: {e}")
-
-                        slot["last_state"] = current_state
-                        if is_finished:
-                            slot["is_finished"] = True
-                            print(f"✅ Игра Баккара #N{game_num} завершена: Игрок {p1_score} - {p2_score} Банкир")
-
-            # Очистка завершенных игр из памяти
-            finished_to_remove = [
-                gid for gid, data in active_games.items()
-                if data["is_finished"] and gid not in current_game_ids
-            ]
-            for gid in finished_to_remove:
-                del active_games[gid]
-
-            time.sleep(3)
-
+            api_cycle()
+            time.sleep(15)
         except Exception as e:
-            print(f"❌ Ошибка главного цикла: {e}")
-            time.sleep(5)
+            print(f"⚠️ ошибка цикла: {e}")
+            time.sleep(30)
 
 
 if __name__ == "__main__":
