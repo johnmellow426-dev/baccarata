@@ -9,10 +9,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 PREDICTION_CHANNEL_ID = os.getenv("PREDICTION_CHANNEL_ID")
 
-# Границы разницы последних 3-х цифр ID
-MIN_DELTA_3D = int(os.getenv("MIN_DELTA_3D", 12))
-MAX_DELTA_3D = int(os.getenv("MAX_DELTA_3D", 13))
-
 # ID Спорта для Баккары
 BACCARAT_SPORT_ID = 236
 
@@ -26,20 +22,15 @@ HEADERS = {
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 lock = threading.Lock()
 
-# ==================== СОСТОЯНИЕ ====================
+# ==================== СОСТОЯНИЕ И СТАТИСТИКА ====================
 sent_games = set()
 last_processed_gid = None
 
+# Учет статистики результатов по каждой разнице 2D: { diff_val: {"total": 0, "2/3": 0, "3/2": 0} }
+diff_stats = {}
+
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
-def get_last_3_digits(gid):
-    """Возвращает последние 3 цифры Game ID как число"""
-    try:
-        return int(str(gid)[-3:])
-    except (ValueError, TypeError):
-        return None
-
-
 def get_last_2_digits(gid):
     """Возвращает последние 2 цифры Game ID как число"""
     try:
@@ -48,18 +39,17 @@ def get_last_2_digits(gid):
         return None
 
 
-def calculate_delta_3d(prev_gid, curr_gid):
-    """Вычисляет разницу последних 3-х цифр с учетом перехода через 1000"""
-    prev_3d = get_last_3_digits(prev_gid)
-    curr_3d = get_last_3_digits(curr_gid)
-    
-    if prev_3d is None or curr_3d is None:
-        return None
+def log_diff_stat(diff_val, outcome=None):
+    """Ведет учет вызовов и заходит в статистику по конкретной разнице"""
+    with lock:
+        if diff_val not in diff_stats:
+            diff_stats[diff_val] = {"total": 0, "2/3": 0, "3/2": 0}
         
-    delta = curr_3d - prev_3d
-    if delta < 0:
-        delta += 1000
-    return delta
+        diff_stats[diff_val]["total"] += 1
+        if outcome in ["2/3", "3/2"]:
+            diff_stats[diff_val][outcome] += 1
+
+        print(f"📊 [УЧЕТ Δ2D={diff_val}] Всего сигналов: {diff_stats[diff_val]['total']} | 2/3: {diff_stats[diff_val]['2/3']} | 3/2: {diff_stats[diff_val]['3/2']}")
 
 
 # ==================== API / TG ====================
@@ -109,20 +99,25 @@ def send_prediction(text):
         return None
 
 
-def _make_pred(di_num, delta, prev_2d, curr_2d):
-    """Формирует и отправляет прогноз на текущую и следующую раздачу"""
+def _make_pred(di_num, prev_2d, curr_2d, diff_2d):
+    """Формирует прогноз на исходы 2/3 и 3/2"""
     next_di_num = di_num + 1
     
     text = (
         f"🔥 <b>СИГНАЛ | БАККАРА</b>\n"
         f"──────────────────────────────\n"
         f"🎯 <b>Ожидаются игры:</b> #N{di_num} - #N{next_di_num}\n"
-        f"📊Тотал 2/3, 3/2 \n"
+        f"🎲 <b>Прогноз исходов:</b> <code>2/3</code> и <code>3/2</code>\n"
+        f"──────────────────────────────\n"
+        f"📉 <b>2 последние цифры ID:</b> {prev_2d} ➔ {curr_2d}\n"
+        f"📐 <b>Разница (Δ2D):</b> {diff_2d}\n"
         f"──────────────────────────────\n"
         f"⏳ <i>Вход на 1-2 шага (догон)</i>"
     )
     
     sent = send_prediction(text)
+    if sent:
+        log_diff_stat(diff_2d)
     return bool(sent)
 
 
@@ -133,7 +128,6 @@ def api_cycle():
     if not raw_games:
         return
 
-    # Фильтрация исключительно на Баккару (SI == 236)
     games = [g for g in raw_games if g.get("SI") == BACCARAT_SPORT_ID]
 
     new_games = []
@@ -148,7 +142,6 @@ def api_cycle():
         if text:
             send_to_channel(text)
             
-    # Сортировка по возрастанию Display ID
     new_games.sort(key=lambda g: int(g.get("DI") or 0))
 
     for game in new_games:
@@ -161,23 +154,17 @@ def api_cycle():
         di_num = int(di)
 
         if last_processed_gid is not None:
-            delta_3d = calculate_delta_3d(last_processed_gid, gid_num)
-            
             prev_2d = get_last_2_digits(last_processed_gid)
             curr_2d = get_last_2_digits(gid_num)
             
-            if delta_3d is not None and prev_2d is not None and curr_2d is not None:
-                # ПРОВЕРКА ДВУХ УСЛОВИЙ:
-                # 1. Дельта 3-х цифр в окне 200-600
-                # 2. 2 последние цифры ПРЕДЫДУЩЕЙ игры БОЛЬШЕ текущей (prev_2d > curr_2d)
-                if MIN_DELTA_3D <= delta_3d <= MAX_DELTA_3D and prev_2d > curr_2d:
-                    if _make_pred(di_num, delta_3d, prev_2d, curr_2d):
-                        print(f"🔥 БАККАРА: Сигнал #N{di_num}-#N{di_num+1} | Δ3D: {delta_3d} | 2D: {prev_2d} > {curr_2d}")
+            if prev_2d is not None and curr_2d is not None:
+                # ГЛАВНОЕ УСЛОВИЕ: Предыдущие 2 цифры БОЛЬШЕ текущих
+                if prev_2d > curr_2d:
+                    diff_2d = prev_2d - curr_2d
+                    if _make_pred(di_num, prev_2d, curr_2d, diff_2d):
+                        print(f"🔥 БАККАРА: Сигнал #N{di_num}-#N{di_num+1} | 2D: {prev_2d} ➔ {curr_2d} | Δ2D = {diff_2d}")
                 else:
-                    if prev_2d <= curr_2d:
-                        print(f"ℹ️ [Баккара] #N{di_num} Пропуск: 2 последние цифры возрастают ({prev_2d} <= {curr_2d})")
-                    else:
-                        print(f"ℹ️ [Баккара] #N{di_num} Пропуск: Δ3D={delta_3d} вне [{MIN_DELTA_3D}-{MAX_DELTA_3D}]")
+                    print(f"ℹ️ [Баккара] #N{di_num} Пропуск: 2D возрастают ({prev_2d} <= {curr_2d})")
 
         last_processed_gid = gid_num
 
@@ -189,8 +176,8 @@ def api_cycle():
 
 
 def main():
-    print(f"🚀 ЗАПУСК БОТА (УСЛОВИЕ: Δ3D [{MIN_DELTA_3D}-{MAX_DELTA_3D}] И PREV_2D > CURR_2D)")
-    send_to_channel("🟢 <b>Бот запущен</b> | Фильтрация по убыванию 2-х цифр ID + Дельта 3D")
+    print("🚀 ЗАПУСК БОТА (ФИЛЬТР: PREV_2D > CURR_2D | ПРОГНОЗ: 2/3 И 3/2)")
+    send_to_channel("🟢 <b>Бот запущен</b> | Сигналы на исходы 2/3 и 3/2 при убывании 2-х цифр ID")
     
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
     
