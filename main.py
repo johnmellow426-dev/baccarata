@@ -1,19 +1,17 @@
 import os
 import time
-import re
 import threading
 import requests
 import telebot
-from telebot.apihelper import ApiTelegramException
 
 # ==================== НАСТРОЙКИ (ENV) ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 PREDICTION_CHANNEL_ID = os.getenv("PREDICTION_CHANNEL_ID")
 
-# Новые границы разницы последних 3-х цифр ID
-MIN_DELTA_3D = int(os.getenv("MIN_DELTA_3D", 200))
-MAX_DELTA_3D = int(os.getenv("MAX_DELTA_3D", 600))
+# Границы разницы последних 3-х цифр ID
+MIN_DELTA_3D = int(os.getenv("MIN_DELTA_3D", 12))
+MAX_DELTA_3D = int(os.getenv("MAX_DELTA_3D", 13))
 
 # ID Спорта для Баккары
 BACCARAT_SPORT_ID = 236
@@ -42,8 +40,16 @@ def get_last_3_digits(gid):
         return None
 
 
+def get_last_2_digits(gid):
+    """Возвращает последние 2 цифры Game ID как число"""
+    try:
+        return int(str(gid)[-2:])
+    except (ValueError, TypeError):
+        return None
+
+
 def calculate_delta_3d(prev_gid, curr_gid):
-    """Вычисляет разницу последних 3-х цифр с учетом возможного перехода через 1000"""
+    """Вычисляет разницу последних 3-х цифр с учетом перехода через 1000"""
     prev_3d = get_last_3_digits(prev_gid)
     curr_3d = get_last_3_digits(curr_gid)
     
@@ -103,7 +109,7 @@ def send_prediction(text):
         return None
 
 
-def _make_pred(di_num, delta):
+def _make_pred(di_num, delta, prev_2d, curr_2d):
     """Формирует и отправляет прогноз на текущую и следующую раздачу"""
     next_di_num = di_num + 1
     
@@ -111,7 +117,7 @@ def _make_pred(di_num, delta):
         f"🔥 <b>СИГНАЛ | БАККАРА</b>\n"
         f"──────────────────────────────\n"
         f"🎯 <b>Ожидаются игры:</b> #N{di_num} - #N{next_di_num}\n"
-        f"📊 <b>Разница 3-х цифр ID:</b> {delta} (в интервале 200-600)\n"
+        f"📊Тотал 2/3, 3/2 \n"
         f"──────────────────────────────\n"
         f"⏳ <i>Вход на 1-2 шага (догон)</i>"
     )
@@ -155,15 +161,23 @@ def api_cycle():
         di_num = int(di)
 
         if last_processed_gid is not None:
-            # Вычисляем разницу последних 3-х цифр ID
             delta_3d = calculate_delta_3d(last_processed_gid, gid_num)
             
-            if delta_3d is not None:
-                if MIN_DELTA_3D <= delta_3d <= MAX_DELTA_3D:
-                    if _make_pred(di_num, delta_3d):
-                        print(f"🔥 БАККАРА: Прогноз отправлен на игры #N{di_num}-#N{di_num + 1} (Δ3D: {delta_3d})")
+            prev_2d = get_last_2_digits(last_processed_gid)
+            curr_2d = get_last_2_digits(gid_num)
+            
+            if delta_3d is not None and prev_2d is not None and curr_2d is not None:
+                # ПРОВЕРКА ДВУХ УСЛОВИЙ:
+                # 1. Дельта 3-х цифр в окне 200-600
+                # 2. 2 последние цифры ПРЕДЫДУЩЕЙ игры БОЛЬШЕ текущей (prev_2d > curr_2d)
+                if MIN_DELTA_3D <= delta_3d <= MAX_DELTA_3D and prev_2d > curr_2d:
+                    if _make_pred(di_num, delta_3d, prev_2d, curr_2d):
+                        print(f"🔥 БАККАРА: Сигнал #N{di_num}-#N{di_num+1} | Δ3D: {delta_3d} | 2D: {prev_2d} > {curr_2d}")
                 else:
-                    print(f"ℹ️ [Баккара] #N{di_num} Δ3D={delta_3d} вне интервала [{MIN_DELTA_3D}-{MAX_DELTA_3D}]")
+                    if prev_2d <= curr_2d:
+                        print(f"ℹ️ [Баккара] #N{di_num} Пропуск: 2 последние цифры возрастают ({prev_2d} <= {curr_2d})")
+                    else:
+                        print(f"ℹ️ [Баккара] #N{di_num} Пропуск: Δ3D={delta_3d} вне [{MIN_DELTA_3D}-{MAX_DELTA_3D}]")
 
         last_processed_gid = gid_num
 
@@ -175,8 +189,8 @@ def api_cycle():
 
 
 def main():
-    print(f"🚀 ЗАПУСК БОТА (СИГНАЛЫ РАЗНИЦЫ 3-х ЦИФР ID: {MIN_DELTA_3D}-{MAX_DELTA_3D})")
-    send_to_channel("🟢 <b>Бот запущен</b> | Анализ разницы 3х цифр ID для прогноза раздач")
+    print(f"🚀 ЗАПУСК БОТА (УСЛОВИЕ: Δ3D [{MIN_DELTA_3D}-{MAX_DELTA_3D}] И PREV_2D > CURR_2D)")
+    send_to_channel("🟢 <b>Бот запущен</b> | Фильтрация по убыванию 2-х цифр ID + Дельта 3D")
     
     threading.Thread(target=bot.infinity_polling, daemon=True).start()
     
