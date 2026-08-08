@@ -102,7 +102,24 @@ def update_diff_stats(stats_dict, label_tag, diff_val, is_win):
 
 
 # ==================== РАБОТА С TELEGRAM ====================
+def format_game_info(game):
+    """Форматирует сообщение анонса будущей игры"""
+    try:
+        g_i = game.get('I', 'N/A')
+        g_di = game.get('DI', 'N/A')
+        sport_name = game.get('SN', 'Баккара')
+        return (
+            f"🎴 <b>{sport_name}</b> | ИГРА #N{g_i}\n"
+            f"Display ID: {g_di}\n"
+            f"──────────────────────────────\n"
+        )
+    except Exception as e:
+        print(f"⚠️ fmt: {e}")
+        return None
+
+
 def send_to_channel(text):
+    """Отправка анонса в основной канал анонсов"""
     if not CHANNEL_ID:
         return False
     try:
@@ -228,6 +245,12 @@ def api_cycle():
         sent_games.add(gid)
         new_games.append(game)
         
+        # 1. Отправляем анонс будущей игры в основной канал
+        text = format_game_info(game)
+        if text:
+            send_to_channel(text)
+
+        # 2. Передаем игру на финализацию открытых сигналов
         if di:
             check_and_finalize_predictions(int(di), gid)
             
