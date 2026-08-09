@@ -99,22 +99,50 @@ def get_transition_stats(prev_2d, curr_2d):
 
 
 # ==================== ПАРСИНГ КАНАЛА СТАТИСТИКИ ====================
+# ==================== ПАРСИНГ КАНАЛА СТАТИСТИКИ ====================
+def count_cards_in_string(cards_str):
+    """
+    Считает количество карт в строке, подсчитывая символы мастей.
+    Каждая карта имеет ровно одну масть: ♠ ♥ ♦ ♣
+    """
+    suit_chars = ['♠', '♥', '♦', '♣']
+    count = 0
+    for char in cards_str:
+        if char in suit_chars:
+            count += 1
+    return count
+
+
 def parse_stats_message(text):
     """
     Парсит сообщение из канала статистики.
+    
     Пример: '#N611. ✅6(Q♣️6♥️) 1(2♠️Q♠️9♣️) #T7'
-    Возвращает: (di, outcome) -> (611, '6/1')
+    
+    ВАЖНО: Числа перед скобками (6 и 1) — это ОЧКИ, а не количество карт!
+    Количество карт определяется по содержимому скобок (по символам мастей).
+    
+    Возвращает: (di, outcome) -> (611, '2/3')
     """
     if not text:
         return None, None
     
-    # Регулярное выражение ищет: #N{число}. ... {число}(скобки) {число}(скобки)
-    match = re.search(r"#N(\d+)\..*?(\d+)\([^)]*\)\s+(\d+)\([^)]*\)", text, re.DOTALL)
+    # Ищем: #N{число}. ... ({карты игрока}) ... ({карты банкира})
+    match = re.search(r"#N(\d+)\..*?\(([^)]*)\)\s*\(([^)]*)\)", text, re.DOTALL)
     if match:
         di = int(match.group(1))
-        p1 = int(match.group(2))
-        p2 = int(match.group(3))
-        return di, f"{p1}/{p2}"
+        p1_cards_str = match.group(2)  # Содержимое первой скобки (игрок)
+        p2_cards_str = match.group(3)  # Содержимое второй скобки (банкир)
+        
+        p1_count = count_cards_in_string(p1_cards_str)
+        p2_count = count_cards_in_string(p2_cards_str)
+        
+        # Проверяем, что удалось посчитать карты
+        if p1_count > 0 and p2_count > 0:
+            outcome = f"{p1_count}/{p2_count}"
+            print(f"   🔢 Парсинг: Игрок={p1_cards_str} ({p1_count} карт) | Банкир={p2_cards_str} ({p2_count} карт) → {outcome}")
+            return di, outcome
+    
     return None, None
 
 @bot.channel_post_handler(content_types=['text'])
