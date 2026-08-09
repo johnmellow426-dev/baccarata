@@ -29,12 +29,12 @@ HEADERS = {
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 lock = threading.Lock()
 
-# ==================== НАСТРОЙКИ ФИЛЬТРА ====================
+# ==================== НАСТРОЙКИ ФИЛЬТРА (СРАЗУ В ПРОГНОЗ) ====================
 DB_NAME = "baccarat_history.db"
-ENABLE_FILTER = True
-MIN_SAMPLES = 5          # Минимум исторических случаев для включения фильтра
-MIN_WINRATE = 0.55       # Минимальный винрейт (55%) для пропуска сигнала
-API_FALLBACK_DELAY = 120 # Секунд до попытки получить исход через API
+ENABLE_FILTER = True       # Фильтр ВКЛЮЧЕН
+MIN_SAMPLES = 1            # Минимум 1 исторический случай для применения фильтра
+MIN_WINRATE = 0.50         # 50% винрейт — если данные есть и винрейт >= 50%, сигнал проходит
+API_FALLBACK_DELAY = 120   # Секунд до попытки получить исход через API
 
 # ==================== СОСТОЯНИЕ ====================
 sent_games = set()
@@ -98,10 +98,7 @@ def get_transition_stats(prev_2d, curr_2d):
 
 # ==================== ПАРСИНГ КАНАЛА СТАТИСТИКИ ====================
 def count_cards_in_string(cards_str):
-    """
-    Считает количество карт по символам мастей.
-    Каждая карта имеет ровно одну масть: ♠ ♥ ♦ ♣
-    """
+    """Считает количество карт по символам мастей"""
     suit_chars = ['♠', '♥', '♦', '♣']
     count = 0
     for char in cards_str:
@@ -114,31 +111,23 @@ def parse_stats_message(text):
     """
     Парсит сообщение из канала статистики.
     Пример: '#N611. ✅6(Q♣️6♥️) 1(2♠️Q♠️9♣️) #T7'
-    
-    ВАЖНО: Числа перед скобками (6 и 1) — это ОЧКИ, а не количество карт!
-    Количество карт определяется по содержимому скобок (по символам мастей).
-    
     Возвращает: (di, outcome) -> (611, '2/3')
     """
     if not text:
         return None, None
     
-    # Ищем Display ID
     di_match = re.search(r"#N(\d+)\.", text)
     if not di_match:
         return None, None
     di = int(di_match.group(1))
     
-    # Ищем все скобки в тексте
     parentheses = re.findall(r"\(([^)]+)\)", text)
     
-    # Фильтруем скобки, содержащие карты (символы мастей)
     card_parentheses = []
     for p in parentheses:
         if count_cards_in_string(p) > 0:
             card_parentheses.append(p)
     
-    # Нужно минимум 2 скобки с картами: игрок и банкир
     if len(card_parentheses) >= 2:
         p1_count = count_cards_in_string(card_parentheses[0])
         p2_count = count_cards_in_string(card_parentheses[1])
@@ -160,10 +149,8 @@ def is_stats_channel(message):
         return False
     
     if STATS_CHANNEL_ID.startswith('@'):
-        # Публичный канал: сравниваем по username
         return message.chat.username and message.chat.username.lower() == STATS_CHANNEL_ID.lstrip('@').lower()
     else:
-        # Приватный канал: сравниваем по id
         return str(message.chat.id) == str(STATS_CHANNEL_ID)
 
 
@@ -182,7 +169,6 @@ def process_channel_stats(message):
     di, outcome = parse_stats_message(text)
     
     if di and outcome:
-        # Ищем игру в трекере по Display ID
         gid_found = None
         info_found = None
         for g_id, info in tracked_games.items():
@@ -200,12 +186,11 @@ def process_channel_stats(message):
             else:
                 print(f"ℹ️ [КАНАЛ] Игра #N{di} уже сохранена в БД")
         else:
-            print(f"⚠️ [КАНАЛ] Игра #N{di} не найдена в трекере (возможно, анонс был до запуска бота)")
+            print(f"⚠️ [КАНАЛ] Игра #N{di} не найдена в трекере")
     else:
         print(f"⏭️ [КАНАЛ] Сообщение не содержит данных о картах")
 
 
-# Обработчики НОВЫХ и ОТРЕДАКТИРОВАННЫХ сообщений канала
 @bot.channel_post_handler(content_types=['text'])
 def handle_new_channel_post(message):
     process_channel_stats(message)
@@ -348,6 +333,7 @@ def send_to_channel(text):
 
 def _make_pred(target_chat_id, preds_list, di_num, prev_2d, curr_2d, diff_2d, is_test=False):
     if not target_chat_id:
+        print(f"   ⚠️ Канал для сигналов не указан (chat_id=None)")
         return False
     
     # --- ПРОВЕРКА ФИЛЬТРА ПО БД ---
@@ -357,12 +343,13 @@ def _make_pred(target_chat_id, preds_list, di_num, prev_2d, curr_2d, diff_2d, is
         
         if total > 0:
             winrate = hits / total
-            print(f"🔍 БД: Переход {prev_2d} ➔ {curr_2d} ({direction}) | Исторически: {hits}/{total} ({winrate*100:.1f}%)")
+            print(f"   🔍 БД: Переход {prev_2d} ➔ {curr_2d} ({direction}) | Исторически: {hits}/{total} ({winrate*100:.1f}%)")
+            
             if total >= MIN_SAMPLES and winrate < MIN_WINRATE:
-                print(f"⛔ ФИЛЬТР: Сигнал заблокирован (винрейт {winrate*100:.1f}% < {MIN_WINRATE*100}%)")
+                print(f"   ⛔ ФИЛЬТР: Сигнал заблокирован (винрейт {winrate*100:.1f}% < {MIN_WINRATE*100}%)")
                 return False
         else:
-            print(f"🔍 БД: Переход {prev_2d} ➔ {curr_2d} | Данных нет, отправляем для разведки.")
+            print(f"   🔍 БД: Переход {prev_2d} ➔ {curr_2d} | Данных нет, отправляем для разведки.")
     
     next_di_num = di_num + 1
     tag = "🧪 ТЕСТОВЫЙ (УВЕЛИЧЕНИЕ)" if is_test else "🔥 ОСНОВНОЙ (УБЫВАНИЕ)"
@@ -401,9 +388,17 @@ def api_cycle():
     global last_processed_gid
     raw_games = fetch_data()
     if not raw_games:
+        print("⚠️ API вернул пустой ответ")
         return
     
     games = [g for g in raw_games if g.get("SI") == BACCARAT_SPORT_ID]
+    
+    if not games:
+        print(f"ℹ️ Баккара не найдена в линии (всего игр: {len(raw_games)})")
+        return
+    
+    print(f"📡 [API] Получено {len(games)} игр Баккары")
+    
     new_games = []
     
     for game in games:
@@ -412,7 +407,6 @@ def api_cycle():
         if not gid or not di:
             continue
         
-        # Добавляем в трекер если еще нет
         if gid not in tracked_games:
             tracked_games[gid] = {
                 "di": int(di),
@@ -430,6 +424,7 @@ def api_cycle():
         text = format_game_info(game)
         if text:
             send_to_channel(text)
+            print(f"📢 [АНОНС] Игра #N{di} (ID: {gid}) опубликована в канале")
     
     # Fallback: проверяем игры, которые давно в трекере но не получили исход
     for gid, info in list(tracked_games.items()):
@@ -460,21 +455,38 @@ def api_cycle():
         
         gid_num = int(gid)
         di_num = int(di)
+        curr_2d = get_last_2_digits(gid_num)
         
-        if last_processed_gid is not None:
+        print(f"🎮 [ОБРАБОТКА] Игра #N{di} (ID: {gid}) | last_2d: {curr_2d}")
+        
+        if last_processed_gid is None:
+            print(f"   ⏸️ Это первая игра после запуска, ждем следующую для сравнения")
+        else:
             prev_2d = get_last_2_digits(last_processed_gid)
-            curr_2d = get_last_2_digits(gid_num)
             
             if prev_2d is not None and curr_2d is not None:
+                print(f"   🔍 Сравнение: prev_2d={prev_2d} ➔ curr_2d={curr_2d}")
+                
                 if prev_2d > curr_2d:
                     diff_2d = prev_2d - curr_2d
+                    print(f"   📉 УБЫВАНИЕ (Δ2D={diff_2d}) → Отправляем ОСНОВНОЙ сигнал")
+                    
                     if _make_pred(PREDICTION_CHANNEL_ID, active_preds, di_num, prev_2d, curr_2d, diff_2d, is_test=False):
-                        print(f"🔥 ОСНОВНОЙ | 2D: {prev_2d} ➔ {curr_2d} | Δ2D = {diff_2d}")
+                        print(f"   ✅ 🔥 ОСНОВНОЙ СИГНАЛ отправлен на #N{di_num}-#N{di_num+1}")
+                    else:
+                        print(f"   ❌ ОСНОВНОЙ сигнал НЕ отправлен")
                 
                 elif prev_2d < curr_2d:
                     diff_2d = curr_2d - prev_2d
+                    print(f"   📈 УВЕЛИЧЕНИЕ (Δ2D={diff_2d}) → Отправляем ТЕСТОВЫЙ сигнал")
+                    
                     if _make_pred(TEST_PREDICTION_CHANNEL_ID, test_active_preds, di_num, prev_2d, curr_2d, diff_2d, is_test=True):
-                        print(f"🧪 ТЕСТОВЫЙ | 2D: {prev_2d} ➔ {curr_2d} | Δ2D = {diff_2d}")
+                        print(f"   ✅ 🧪 ТЕСТОВЫЙ СИГНАЛ отправлен на #N{di_num}-#N{di_num+1}")
+                    else:
+                        print(f"   ❌ ТЕСТОВЫЙ сигнал НЕ отправлен")
+                
+                else:
+                    print(f"   ⏭️ 2D равны ({prev_2d} == {curr_2d}) → Сигнал не нужен")
         
         last_processed_gid = gid_num
     
@@ -586,7 +598,7 @@ def main():
     else:
         print(f"\n⚠️ STATS_CHANNEL_ID не указан! Парсинг канала статистики ОТКЛЮЧЕН.")
     
-    send_to_channel("🟢 <b>Бот запущен</b> | Мониторинг канала статистики активирован\nКоманды: /stats /test_parse /debug /clear_db")
+    send_to_channel("🟢 <b>Бот запущен</b> | Фильтр: MIN_SAMPLES=1, MIN_WINRATE=50%\nКоманды: /stats /test_parse /debug /clear_db")
     
     threading.Thread(target=polling_wrapper, daemon=True).start()
     
