@@ -7,7 +7,8 @@ import telebot
 
 # ==================== НАСТРОЙКИ (ENV) ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PREDICTION_CHANNEL_ID = os.getenv("PREDICTION_CHANNEL_ID")
+CHANNEL_ID = os.getenv("CHANNEL_ID")                     # Канал для анонсов будущих игр
+PREDICTION_CHANNEL_ID = os.getenv("PREDICTION_CHANNEL_ID") # Канал для сигналов/прогнозов
 
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "melbet-4866.pro")
 
@@ -96,6 +97,35 @@ def update_diff_stats(diff_val, is_win):
         print(f"📊 [Δ2D={diff_val}] Проходов: {wins}/{total} ({winrate}%) | Промахов: {diff_stats[diff_val]['loss']}")
 
 
+# ==================== АНОНСЫ БУДУЩИХ ИГР ====================
+def format_game_info(game):
+    """Форматирует сообщение анонса будущей игры"""
+    try:
+        g_i = game.get('I', 'N/A')
+        g_di = game.get('DI', 'N/A')
+        sport_name = game.get('SN', 'Баккара')
+        return (
+            f"🎴 <b>{sport_name}</b> | ИГРА #N{g_i}\n"
+            f"Display ID: {g_di}\n"
+            f"──────────────────────────────\n"
+        )
+    except Exception as e:
+        print(f"⚠️ fmt: {e}")
+        return None
+
+
+def send_to_channel(text):
+    """Отправка анонса в канал анонсов"""
+    if not CHANNEL_ID:
+        return False
+    try:
+        bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
+        return True
+    except Exception as e:
+        print(f"⚠️ send main: {e}")
+        return False
+
+
 # ==================== ФУНКЦИИ ПРОГНОЗИРОВАНИЯ ====================
 def make_prediction(di_num, prev_2d, curr_2d, diff_2d):
     """Отправляет лаконичный сигнал в канал прогнозов"""
@@ -106,10 +136,10 @@ def make_prediction(di_num, prev_2d, curr_2d, diff_2d):
     target_dis = [di_num, di_num + 1, di_num + 2]
     
     text = (
-        f"🎲 <b>Игра № {di_num}</b>\n"
-        f"🎯 <b>3/2</b>\n"
-        f"🔄 <b>Догон: 2</b>\n"
-        f"⏳ <b>Результат:</b> <i>Ожидание...</i>"
+        f"🎰 <b>Игра № {di_num}</b>\n"
+        f"🃏 <b>Прогноз:</b> 3/2\n"
+        f"🔄 <b>Догонов:</b> 2\n"
+        f"📌 <b>Результат:</b> ⏳ <i>В игре...</i>"
     )
     
     try:
@@ -151,13 +181,16 @@ def check_and_finalize_predictions(game_di, game_gid):
                 # Завершаем если есть попадание ИЛИ сыграли все 3 игры
                 if has_hit or all_finished:
                     status_symbol = "✅" if has_hit else "❌"
+                    status_badge = "🟩 <b>ПРОХОД</b>" if has_hit else "🟥 <b>ПРОМАХ</b>"
+                    
                     res_str = ", ".join([f"{v}" for k, v in pred["results"].items()])
                     
                     updated_text = (
-                        f"🎲 <b>Игра № {pred['target_dis'][0]}</b>\n"
-                        f"🎯 <b>3/2</b>\n"
-                        f"🔄 <b>Догон: 2</b>\n"
-                        f"📊 <b>Результат:</b> {res_str} {status_symbol}"
+                        f"🎰 <b>Игра № {pred['target_dis'][0]}</b>\n"
+                        f"🃏 <b>Прогноз:</b> 3/2\n"
+                        f"🔄 <b>Догонов:</b> 2\n"
+                        f"📌 <b>Результат:</b> {res_str} {status_symbol}\n"
+                        f"Итог: {status_badge}"
                     )
 
                     try:
@@ -197,7 +230,12 @@ def api_cycle():
         sent_games.add(gid)
         new_games.append(game)
 
-        # Передаем игру на расчет текущих открытых сигналов
+        # 1. Отправляем анонс будущей игры в CHANNEL_ID
+        text = format_game_info(game)
+        if text:
+            send_to_channel(text)
+
+        # 2. Передаем игру на расчет текущих открытых сигналов
         if di:
             check_and_finalize_predictions(int(di), gid)
             
@@ -222,7 +260,7 @@ def api_cycle():
                 # УСЛОВИЕ: Разница Δ2D больше 32 и меньше 50
                 if 12 < diff_2d < 67:
                     if make_prediction(di_num, prev_2d, curr_2d, diff_2d):
-                        print(f"🔥 Прогноз отправлен на #N{di_num} (+2 догона) | Δ2D = {diff_2d}")
+                        print(f"🔥 Прогноз отправлен на #N{di_num} в PREDICTION_CHANNEL_ID | Δ2D = {diff_2d}")
 
         last_processed_gid = gid_num
 
@@ -231,10 +269,15 @@ def api_cycle():
 
 
 def main():
-    print("🚀 ЗАПУСК БОТА ПРОГНОЗОВ БАККАРА (КОРОТКИЙ ФОРМАТ | 3/2)")
+    print("🚀 ЗАПУСК БОТА (АНОНСЫ В CHANNEL_ID | ПРОГНОЗЫ В PREDICTION_CHANNEL_ID)")
     
-    threading.Thread(target=bot.infinity_polling, daemon=True).start()
-    
+    # Сбрасываем возможные конфликты поллинга/вебхуков
+    try:
+        bot.remove_webhook()
+    except Exception as e:
+        print(f"⚠️ Сброс webhook: {e}")
+
+    # Запускаем основной цикл опроса API без infinity_polling
     while True:
         try:
             api_cycle()
