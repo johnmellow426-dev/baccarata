@@ -7,10 +7,13 @@ import telebot
 
 # ==================== НАСТРОЙКИ (ENV) ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")                     # Канал для анонсов будущих игр
-PREDICTION_CHANNEL_ID = os.getenv("PREDICTION_CHANNEL_ID") # Канал для сигналов/прогнозов
+CHANNEL_ID = os.getenv("CHANNEL_ID")                     # Канал анонсов будущих игр
+PREDICTION_CHANNEL_ID = os.getenv("PREDICTION_CHANNEL_ID") # Канал прогнозов
 
 BASE_DOMAIN = os.getenv("BASE_DOMAIN", "melbet-4866.pro")
+
+# РЕЖИМ РАБОТЫ: "DECREASE" (Убывание), "INCREASE" (Возрастание), "HYBRID" (Гибрид)
+MODE = os.getenv("MODE", "INCREASE").upper()
 
 # ID Спорта для Баккары
 BACCARAT_SPORT_ID = 236
@@ -34,7 +37,7 @@ last_processed_gid = None
 
 active_preds = []   # Активные прогнозы
 diff_stats = {}     # Статистика: { diff_val: {"total": 0, "win": 0, "loss": 0} }
-di_to_gid = {}      # Реестр соответствия Display ID (DI) -> Game ID (GID)
+di_to_gid = {}      # Реестр карт: Display ID (DI) -> Game ID (GID)
 
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
@@ -44,6 +47,20 @@ def get_last_2_digits(gid):
         return int(str(gid)[-2:])
     except (ValueError, TypeError):
         return None
+
+
+def calculate_diff_2d(prev_2d, curr_2d, mode):
+    """Рассчитывает разницу Δ2D в зависимости от выбранного режима"""
+    if mode == "DECREASE":
+        # Только убывание: prev > curr
+        return (prev_2d - curr_2d) if prev_2d > curr_2d else None
+    elif mode == "INCREASE":
+        # Только возрастание: curr > prev
+        return (curr_2d - prev_2d) if curr_2d > prev_2d else None
+    elif mode == "HYBRID":
+        # Гибрид: любая абсолютная разница
+        return abs(prev_2d - curr_2d)
+    return None
 
 
 def fetch_data():
@@ -58,36 +75,43 @@ def fetch_data():
 
 
 def fetch_game_cards_outcome(game_id):
-    """Запрашивает детальную статистику завершенной игры"""
+    """Запрашивает детальную статистику завершенной игры с полным логированием"""
     url = STATISTIC_URL_TEMPLATE.format(game_id=game_id)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=7)
-        if resp.status_code == 200 and resp.text.strip():
-            data = resp.json()
-            stat = data.get("statistic", {}).get("main", {})
-            
-            p1_raw = stat.get("P1")
-            p2_raw = stat.get("P2")
-            
-            if p1_raw is None or p2_raw is None:
-                return None
-            
-            # 1. Если пришли JSON-строки карт
-            if isinstance(p1_raw, str) and p1_raw.startswith("["):
-                p1_cards = json.loads(p1_raw)
-                p2_cards = json.loads(p2_raw) if isinstance(p2_raw, str) else p2_raw
-                return f"{len(p1_cards)}/{len(p2_cards)}"
-            
-            # 2. Если пришли списки Python
-            elif isinstance(p1_raw, list) and isinstance(p2_raw, list):
-                return f"{len(p1_raw)}/{len(p2_raw)}"
-            
-            # 3. Если API передает сразу число карт
-            elif isinstance(p1_raw, (int, str)) and isinstance(p2_raw, (int, str)):
-                return f"{p1_raw}/{p2_raw}"
-                
+        if resp.status_code != 200:
+            print(f"⚠️ API вернул код {resp.status_code} для Game ID {game_id}")
+            return None
+
+        text = resp.text.strip()
+        if not text:
+            print(f"⚠️ Пустой ответ от API для Game ID {game_id}")
+            return None
+
+        if text.startswith("<"):
+            print(f"🚫 API заблокировал запрос (HTML вместо JSON) для Game ID {game_id}")
+            return None
+
+        data = resp.json()
+        stat = data.get("statistic", {})
+        main_stat = stat.get("main", {}) if isinstance(stat, dict) else {}
+        
+        # Поиск P1 и P2 в разных структурах JSON
+        p1_raw = main_stat.get("P1") or stat.get("P1") or data.get("P1")
+        p2_raw = main_stat.get("P2") or stat.get("P2") or data.get("P2")
+        
+        if p1_raw is None or p2_raw is None:
+            print(f"🔍 [Game ID {game_id}] Ключи карт P1/P2 еще не доступны в API.")
+            return None
+
+        # Подсчет карт
+        p1_count = len(json.loads(p1_raw)) if isinstance(p1_raw, str) and p1_raw.startswith("[") else (len(p1_raw) if isinstance(p1_raw, list) else p1_raw)
+        p2_count = len(json.loads(p2_raw)) if isinstance(p2_raw, str) and p2_raw.startswith("[") else (len(p2_raw) if isinstance(p2_raw, list) else p2_raw)
+
+        return f"{p1_count}/{p2_count}"
+
     except Exception as e:
-        print(f"⚠️ Ошибка парсинга карт (Game ID {game_id}): {e}")
+        print(f"⚠️ Ошибка запроса карт (Game ID {game_id}): {e}")
     return None
 
 
@@ -107,7 +131,7 @@ def update_diff_stats(diff_val, is_win):
         wins = diff_stats[diff_val]["win"]
         winrate = round((wins / total) * 100, 1) if total > 0 else 0
         
-        print(f"📊 [|Δ2D|={diff_val}] Проходов: {wins}/{total} ({winrate}%) | Промахов: {diff_stats[diff_val]['loss']}")
+        print(f"📊 [Δ2D={diff_val}] Проходов: {wins}/{total} ({winrate}%) | Промахов: {diff_stats[diff_val]['loss']}")
 
 
 # ==================== АНОНСЫ БУДУЩИХ ИГР ====================
@@ -173,30 +197,34 @@ def make_prediction(di_num, prev_2d, curr_2d, diff_2d):
 
 
 def check_active_predictions():
-    """Периодически проверяет карты для всех нерасчитанных активных прогнозов"""
+    """Проверяет карты для активных прогнозов с обновлением в Telegram"""
     with lock:
+        if not active_preds:
+            return
+
         preds_to_remove = []
         for pred in list(active_preds):
             target_dis = [int(x) for x in pred["target_dis"]]
             
-            # Запрашиваем результат для тех целевых игр, где результат еще не сохранен
             for target_di in target_dis:
                 if target_di not in pred["results"]:
                     game_gid = di_to_gid.get(target_di)
-                    if game_gid:
-                        outcome = fetch_game_cards_outcome(game_gid)
-                        if outcome:
-                            print(f"🔎 Получены карты для Игра № {target_di} (ID: {game_gid}): {outcome}")
-                            pred["results"][target_di] = outcome
+                    
+                    if not game_gid:
+                        continue
+
+                    outcome = fetch_game_cards_outcome(game_gid)
+                    if outcome:
+                        print(f"🎯 Карта получена для игры № {target_di}: {outcome}")
+                        pred["results"][target_di] = outcome
             
-            # Попадание если хотя бы в одной из сыгранных игр выпало 3/2
+            # Расчет и закрытие прогноза
             has_hit = any(res == "3/2" for res in pred["results"].values())
             all_finished = len(pred["results"]) >= len(target_dis)
 
             if has_hit or all_finished:
                 status_symbol = "✅" if has_hit else "❌"
                 status_badge = "🟩 <b>ПРОХОД</b>" if has_hit else "🟥 <b>ПРОМАХ</b>"
-                
                 res_str = ", ".join([f"{v}" for k, v in pred["results"].items()])
                 
                 updated_text = (
@@ -214,7 +242,7 @@ def check_active_predictions():
                         text=updated_text,
                         parse_mode="HTML"
                     )
-                    print(f"✅ Прогноз на № {pred['target_dis'][0]} успешно закрыт! (Результаты: {res_str})")
+                    print(f"🎉 Прогноз на № {pred['target_dis'][0]} ЗАКРЫТ!")
                 except Exception as e:
                     print(f"⚠️ Ошибка редактирования сообщения: {e}")
 
@@ -235,14 +263,14 @@ def api_cycle():
 
     games = [g for g in raw_games if g.get("SI") == BACCARAT_SPORT_ID]
 
-    # Обновляем связку Display ID -> Game ID для всех игр в линии
+    # Обновляем реестр соответствия Display ID -> Game ID
     for game in games:
         di = game.get("DI")
         gid = game.get("I")
         if di and gid:
             di_to_gid[int(di)] = int(gid)
 
-    # Проверяем карточные исходы для активных прогнозов
+    # Проверяем карточные результаты открытых сигналов
     check_active_predictions()
 
     new_games = []
@@ -276,17 +304,17 @@ def api_cycle():
             curr_2d = get_last_2_digits(gid_num)
             
             if prev_2d is not None and curr_2d is not None:
-                # Абсолютная разница (модуль)
-                diff_2d = abs(prev_2d - curr_2d)
+                # Вычисление разницы согласно режиму MODE
+                diff_2d = calculate_diff_2d(prev_2d, curr_2d, MODE)
                 
-                # УСЛОВИЕ: Разница |Δ2D| больше 12 и меньше 67
-                if 12 < diff_2d < 67:
+                # Проверяем условия диапазона (12 < Δ2D < 67)
+                if diff_2d is not None and 12 < diff_2d < 67:
                     if make_prediction(di_num, prev_2d, curr_2d, diff_2d):
-                        print(f"🔥 Прогноз отправлен на #N{di_num} | 2D: {prev_2d} ➔ {curr_2d} | |Δ2D| = {diff_2d}")
+                        print(f"🔥 Прогноз отправлен на #N{di_num} [{MODE}] | 2D: {prev_2d} ➔ {curr_2d} | Δ2D = {diff_2d}")
 
         last_processed_gid = gid_num
 
-    # Очистка старых данных
+    # Очистка реестра
     if len(sent_games) > 300: 
         sent_games.clear()
     if len(di_to_gid) > 500:
@@ -294,12 +322,12 @@ def api_cycle():
 
 
 def main():
-    print("🚀 ЗАПУСК БОТА С АКТИВНЫМ МОНИТОРИНГОМ ИСХОДОВ")
+    print(f"🚀 ЗАПУСК БОТА ПРОГНОЗОВ | РЕЖИМ: {MODE}")
     
     try:
         bot.remove_webhook()
     except Exception as e:
-        print(f"⚠️ Ошибка сброса webhook: {e}")
+        print(f"⚠️ Сброс webhook: {e}")
 
     while True:
         try:
