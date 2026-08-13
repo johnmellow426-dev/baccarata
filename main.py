@@ -16,6 +16,11 @@ MODE = os.getenv("MODE", "INCREASE").upper()
 
 BACCARAT_SPORT_ID = 236
 
+MAX_ACTIVE_PREDS = 5
+MAX_CHECKS_PER_CYCLE = 6
+PRED_TIMEOUT = 600
+STAT_TIMEOUT = 5
+
 API_URL = f"https://{BASE_DOMAIN}/service-api/LiveFeed/Get1x2_VZip?sports=236&champs=2050671&count=40&gr=1521&mode=4&country=192&partner=8&getEmpty=true&virtualSports=true&noFilterBlockEvent=true"
 STATISTIC_URL_TEMPLATE = f"https://{BASE_DOMAIN}/cyber-api/mainfeedlive/web/cyber/v3/statistic?country=192&fcountry=192&gameId={{game_id}}&gr=1521&lng=ru&ref=8"
 
@@ -28,6 +33,9 @@ HEADERS = {
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 lock = threading.Lock()
 
+session = requests.Session()
+session.headers.update(HEADERS)
+
 # ==================== СОСТОЯНИЕ ====================
 sent_games = set()
 last_processed_gid = None
@@ -35,12 +43,10 @@ active_preds = []
 diff_stats = {}
 di_to_gid = {}
 
-# ==================== НАБЛЮДЕНИЕ И АНАЛИТИКА ====================
-game_history = deque(maxlen=50)       # Последние 50 результатов игр
-diff_outcome_map = {}                  # {Δ2D: [список исходов]} для корреляции
+game_history = deque(maxlen=50)
+diff_outcome_map = {}
 VALID_OUTCOMES = {"2/2", "3/2", "2/3", "3/3"}
 
-# Статусы активной (незавершённой) игры
 ACTIVE_STATUSES = {
     "Prematch", "PlayerMove", "BankerMove", "DealerMove",
     "Betting", "Pause", "Break", "Waiting", "Preparing",
@@ -48,7 +54,7 @@ ACTIVE_STATUSES = {
 }
 
 
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ====================
 def get_last_2_digits(gid):
     try:
         return int(str(gid)[-2:])
@@ -67,60 +73,48 @@ def calculate_diff_2d(prev_2d, curr_2d, mode):
 
 
 def is_game_finished(data):
-    """Проверяет завершённость игры"""
     stat = data.get("statistic", {})
     main_stat = stat.get("main", {}) if isinstance(stat, dict) else {}
     game_status = main_stat.get("S", "")
-
     if not game_status:
         return False
     if game_status in ACTIVE_STATUSES:
         return False
-
     timer = data.get("timer", {})
-    time_run = timer.get("timeRun", True)
-    if time_run:
+    if timer.get("timeRun", True):
         return False
-
     return True
 
 
 def fetch_data():
     try:
-        resp = requests.get(API_URL, headers=HEADERS, timeout=10)
+        resp = session.get(API_URL, timeout=10)
         if resp.status_code == 200:
             return resp.json().get("Value", [])
     except Exception as e:
-        print(f"⚠️ API LiveFeed: {e}")
+        print(f"⚠️ LiveFeed: {e}")
     return []
 
 
 def fetch_game_cards_outcome(game_id):
-    """Возвращает результат ТОЛЬКО для завершённых игр"""
     url = STATISTIC_URL_TEMPLATE.format(game_id=game_id)
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=7)
-
-        if resp.status_code == 204:
+        resp = session.get(url, timeout=STAT_TIMEOUT)
+        if resp.status_code in (204, 404):
             return None
         if resp.status_code != 200:
             return None
-
         text = resp.text.strip()
         if not text or text.startswith("<"):
             return None
-
         data = resp.json()
-
         if not is_game_finished(data):
             return None
 
         stat = data.get("statistic", {})
         main_stat = stat.get("main", {}) if isinstance(stat, dict) else {}
-
         p1_raw = main_stat.get("P") or stat.get("P") or data.get("P")
         p2_raw = main_stat.get("B") or stat.get("B") or data.get("B")
-
         if p1_raw is None or p2_raw is None:
             return None
 
@@ -134,35 +128,29 @@ def fetch_game_cards_outcome(game_id):
 
         if p1_count == 0 and p2_count == 0:
             return None
-
         return f"{p1_count}/{p2_count}"
 
+    except requests.exceptions.Timeout:
+        pass
     except Exception as e:
-        print(f"⚠️ Ошибка запроса карт (Game ID {game_id}): {e}")
+        print(f"⚠️ Карты GID {game_id}: {e}")
     return None
 
 
-# ==================== АНАЛИТИКА: НАБЛЮДЕНИЕ И ПРОГНОЗ ====================
-def record_result(diff_val, outcome):
-    """Записывает результат игры в историю наблюдения"""
+# ==================== НАБЛЮДЕНИЕ ====================
+def record_result(diff_val, outcome, is_first_game=False):
     if outcome not in VALID_OUTCOMES:
         return
-
     game_history.append(outcome)
-
-    if diff_val is not None:
+    if is_first_game and diff_val is not None:
         if diff_val not in diff_outcome_map:
             diff_outcome_map[diff_val] = []
         diff_outcome_map[diff_val].append(outcome)
-        # Ограничиваем историю по каждому Δ2D
         if len(diff_outcome_map[diff_val]) > 20:
             diff_outcome_map[diff_val] = diff_outcome_map[diff_val][-20:]
 
-    print(f"📝 Записано: Δ2D={diff_val} → {outcome} | История: {list(game_history)[-5:]}")
-
 
 def analyze_streak():
-    """Определяет серию из 3+ одинаковых исходов подряд"""
     if len(game_history) < 3:
         return None
     recent = list(game_history)
@@ -173,13 +161,10 @@ def analyze_streak():
             streak += 1
         else:
             break
-    if streak >= 3:
-        return last  # Прогнозируем продолжение серии
-    return None
+    return last if streak >= 3 else None
 
 
 def analyze_alternation():
-    """Определяет чередование: A, B, A, B → следующий A"""
     if len(game_history) < 4:
         return None
     recent = list(game_history)[-4:]
@@ -189,20 +174,17 @@ def analyze_alternation():
 
 
 def analyze_frequency():
-    """Самый частый исход в последних 10 играх"""
     if len(game_history) < 5:
         return None
     recent = list(game_history)[-10:]
     counts = Counter(recent)
     most_common = counts.most_common(1)[0]
-    # Возвращаем только если исход встречается > 40% случаев
     if most_common[1] / len(recent) > 0.4:
         return most_common[0]
     return None
 
 
 def analyze_diff_correlation(diff_2d):
-    """Анализ корреляции: какой исход чаще всего был при данном Δ2D"""
     if diff_2d not in diff_outcome_map:
         return None
     outcomes = diff_outcome_map[diff_2d]
@@ -216,75 +198,40 @@ def analyze_diff_correlation(diff_2d):
 
 
 def determine_prediction(diff_2d):
-    """
-    Определяет прогноз на основе наблюдения.
-    Приоритет:
-      1. Серия (3+ одинаковых подряд)
-      2. Чередование (A,B,A,B)
-      3. Корреляция с Δ2D
-      4. Частотный анализ
-      5. Фолбэк по чётности Δ2D
-    """
-    # 1. Серия
-    streak_pred = analyze_streak()
-    if streak_pred:
-        print(f"🧠 [СЕРИЯ] Обнаружена серия → {streak_pred}")
-        return streak_pred, "серия"
-
-    # 2. Чередование
-    alt_pred = analyze_alternation()
-    if alt_pred:
-        print(f"🧠 [ЧЕРЕДОВАНИЕ] Обнаружено чередование → {alt_pred}")
-        return alt_pred, "чередование"
-
-    # 3. Корреляция с Δ2D
-    corr_pred = analyze_diff_correlation(diff_2d)
-    if corr_pred:
-        print(f"🧠 [КОРРЕЛЯЦИЯ Δ2D={diff_2d}] → {corr_pred}")
-        return corr_pred, "корреляция"
-
-    # 4. Частотный анализ
-    freq_pred = analyze_frequency()
-    if freq_pred:
-        print(f"🧠 [ЧАСТОТА] Наиболее вероятный → {freq_pred}")
-        return freq_pred, "частота"
-
-    # 5. Фолбэк по чётности
-    fallback = "2/3" if diff_2d % 2 == 0 else "3/2"
-    print(f"🧠 [ФОЛБЭК] Чётность Δ2D={diff_2d} → {fallback}")
-    return fallback, "фолбэк"
+    streak = analyze_streak()
+    if streak:
+        return streak, "серия"
+    alt = analyze_alternation()
+    if alt:
+        return alt, "чередование"
+    corr = analyze_diff_correlation(diff_2d)
+    if corr:
+        return corr, "корреляция"
+    freq = analyze_frequency()
+    if freq:
+        return freq, "частота"
+    return "3/2", "фолбэк"
 
 
-def get_active_prediction_dis():
-    """Возвращает множество DI, на которые уже есть активные прогнозы"""
-    active_dis = set()
-    with lock:
-        for pred in active_preds:
-            for di in pred["target_dis"]:
-                active_dis.add(int(di))
-    return active_dis
+def get_active_target_dis():
+    dis = set()
+    for pred in active_preds:
+        for di in pred["target_dis"]:
+            dis.add(int(di))
+    return dis
 
 
-# ==================== СТАТИСТИКА ====================
 def update_diff_stats(diff_val, is_win):
-    with lock:
-        if diff_val not in diff_stats:
-            diff_stats[diff_val] = {"total": 0, "win": 0, "loss": 0}
-
-        diff_stats[diff_val]["total"] += 1
-        if is_win:
-            diff_stats[diff_val]["win"] += 1
-        else:
-            diff_stats[diff_val]["loss"] += 1
-
-        total = diff_stats[diff_val]["total"]
-        wins = diff_stats[diff_val]["win"]
-        winrate = round((wins / total) * 100, 1) if total > 0 else 0
-
-        print(f"📊 [Δ2D={diff_val}] Проходов: {wins}/{total} ({winrate}%) | Промахов: {diff_stats[diff_val]['loss']}")
+    if diff_val not in diff_stats:
+        diff_stats[diff_val] = {"total": 0, "win": 0, "loss": 0}
+    diff_stats[diff_val]["total"] += 1
+    if is_win:
+        diff_stats[diff_val]["win"] += 1
+    else:
+        diff_stats[diff_val]["loss"] += 1
 
 
-# ==================== АНОНСЫ ====================
+# ==================== АНОНСЫ (ПРИОРИТЕТ №1) ====================
 def format_game_info(game):
     try:
         g_i = game.get('I', 'N/A')
@@ -295,38 +242,31 @@ def format_game_info(game):
             f"Display ID: {g_di}\n"
             f"──────────────────────────────\n"
         )
-    except Exception as e:
-        print(f"⚠️ fmt: {e}")
+    except Exception:
         return None
 
 
 def send_to_channel(text):
     if not CHANNEL_ID:
-        return False
+        return
     try:
         bot.send_message(CHANNEL_ID, text, parse_mode="HTML")
-        return True
     except Exception as e:
-        print(f"⚠️ send main: {e}")
-        return False
+        print(f"⚠️ send: {e}")
 
 
-# ==================== ПРОГНОЗИРОВАНИЕ ====================
+# ==================== ПРОГНОЗЫ (ФОН) ====================
 def make_prediction(di_num, prev_2d, curr_2d, diff_2d):
-    """Отправляет прогноз. Не создаёт дублей на одну игру."""
     if not PREDICTION_CHANNEL_ID:
         return False
-
-    # ✅ ЗАЩИТА ОТ ДУБЛЕЙ: проверяем, нет ли уже прогноза на эти DI
-    active_dis = get_active_prediction_dis()
-    target_dis = [di_num, di_num + 1, di_num + 2]
-
-    # Если хотя бы один из целевых DI уже в активном прогнозе — пропускаем
-    if any(di in active_dis for di in target_dis):
-        print(f"⏭️ Пропуск: игра № {di_num} уже в активном прогнозе")
+    if len(active_preds) >= MAX_ACTIVE_PREDS:
         return False
 
-    # Определяем прогноз на основе наблюдения
+    target_dis = [di_num, di_num + 1, di_num + 2]
+    active_dis = get_active_target_dis()
+    if any(di in active_dis for di in target_dis):
+        return False
+
     prediction_val, method = determine_prediction(diff_2d)
 
     text = (
@@ -340,121 +280,146 @@ def make_prediction(di_num, prev_2d, curr_2d, diff_2d):
     try:
         sent = bot.send_message(PREDICTION_CHANNEL_ID, text, parse_mode="HTML")
         if sent:
-            with lock:
-                active_preds.append({
-                    "chat_id": PREDICTION_CHANNEL_ID,
-                    "msg_id": sent.message_id,
-                    "target_dis": target_dis,
-                    "diff_2d": diff_2d,
-                    "prediction": prediction_val,
-                    "method": method,
-                    "results": {},
-                    "created_at": time.time()
-                })
+            active_preds.append({
+                "chat_id": PREDICTION_CHANNEL_ID,
+                "msg_id": sent.message_id,
+                "target_dis": target_dis,
+                "diff_2d": diff_2d,
+                "prediction": prediction_val,
+                "method": method,
+                "results": {},
+                "created_at": time.time()
+            })
             return True
     except Exception as e:
-        print(f"⚠️ Ошибка отправки прогноза: {e}")
+        print(f"⚠️ Прогноз: {e}")
     return False
 
 
 def check_active_predictions():
-    """Проверяет результаты только завершённых игр"""
-    with lock:
-        if not active_preds:
-            return
+    """Фоновая проверка прогнозов — НЕ блокирует анонсы"""
+    if not active_preds:
+        return
 
-        preds_to_remove = []
-        for pred in list(active_preds):
-            target_dis = [int(x) for x in pred["target_dis"]]
-            prediction_val = pred.get("prediction", "3/2")
+    checks_done = 0
+    preds_to_remove = []
 
-            for target_di in target_dis:
-                if target_di not in pred["results"]:
-                    game_gid = di_to_gid.get(target_di)
+    for pred in list(active_preds):
+        if checks_done >= MAX_CHECKS_PER_CYCLE:
+            break
 
-                    if not game_gid:
-                        continue
+        target_dis = [int(x) for x in pred["target_dis"]]
+        prediction_val = pred.get("prediction", "3/2")
+        first_di = target_dis[0] if target_dis else None
 
-                    outcome = fetch_game_cards_outcome(game_gid)
-                    if outcome:
-                        print(f"🎯 Результат игры № {target_di}: {outcome}")
-                        pred["results"][target_di] = outcome
+        for target_di in target_dis:
+            if checks_done >= MAX_CHECKS_PER_CYCLE:
+                break
+            if target_di in pred["results"]:
+                continue
 
-                        # ✅ Записываем результат в историю наблюдения
-                        record_result(pred["diff_2d"], outcome)
+            game_gid = di_to_gid.get(target_di)
+            if not game_gid:
+                continue
 
-            has_hit = any(res == prediction_val for res in pred["results"].values())
-            all_finished = len(pred["results"]) >= len(target_dis)
+            outcome = fetch_game_cards_outcome(game_gid)
+            checks_done += 1
 
-            # Таймаут 15 минут
-            is_timeout = (time.time() - pred.get("created_at", 0)) > 900
-            if is_timeout and not all_finished:
-                all_finished = True
-                has_hit = False
+            if outcome:
+                pred["results"][target_di] = outcome
+                is_first = (target_di == first_di)
+                record_result(pred["diff_2d"], outcome, is_first_game=is_first)
 
-            if has_hit or all_finished:
-                if is_timeout:
-                    status_symbol = "⚪"
-                    status_badge = "⚪ <b>ОТМЕНЕН</b>"
+        has_hit = any(res == prediction_val for res in pred["results"].values())
+        all_finished = len(pred["results"]) >= len(target_dis)
+        age = time.time() - pred.get("created_at", 0)
+        is_timeout = age > PRED_TIMEOUT
+
+        if is_timeout and not all_finished:
+            all_finished = True
+            has_hit = False
+
+        if has_hit or all_finished:
+            if is_timeout:
+                status_badge = "⚪ <b>ОТМЕНЕН</b>"
+            elif has_hit:
+                status_badge = "🟩 <b>ПРОХОД</b>"
+            else:
+                status_badge = "🟥 <b>ПРОМАХ</b>"
+
+            res_list = []
+            for di in target_dis:
+                if di in pred["results"]:
+                    mark = "✅" if pred["results"][di] == prediction_val else "❌"
+                    res_list.append(f"{pred['results'][di]}{mark}")
                 else:
-                    status_symbol = "✅" if has_hit else "❌"
-                    status_badge = "🟩 <b>ПРОХОД</b>" if has_hit else "🟥 <b>ПРОМАХ</b>"
+                    res_list.append("⏱")
 
-                res_str = ", ".join([f"{v}" for k, v in pred["results"].items()]) if pred["results"] else "Нет данных"
+            updated_text = (
+                f"🎰 <b>Игра № {target_dis[0]}</b>\n"
+                f"🃏 <b>Прогноз:</b> {prediction_val}\n"
+                f"🧠 <b>Метод:</b> {pred.get('method', '?')}\n"
+                f"🔄 <b>Догонов:</b> 2\n"
+                f"📌 <b>Результат:</b> {' | '.join(res_list)}\n"
+                f"Итог: {status_badge}"
+            )
 
-                updated_text = (
-                    f"🎰 <b>Игра № {pred['target_dis'][0]}</b>\n"
-                    f"🃏 <b>Прогноз:</b> {prediction_val}\n"
-                    f"🧠 <b>Метод:</b> {pred.get('method', '?')}\n"
-                    f"🔄 <b>Догонов:</b> 2\n"
-                    f"📌 <b>Результат:</b> {res_str} {status_symbol}\n"
-                    f"Итог: {status_badge}"
+            try:
+                bot.edit_message_text(
+                    chat_id=pred["chat_id"],
+                    message_id=pred["msg_id"],
+                    text=updated_text,
+                    parse_mode="HTML"
                 )
+            except Exception:
+                pass
 
-                try:
-                    bot.edit_message_text(
-                        chat_id=pred["chat_id"],
-                        message_id=pred["msg_id"],
-                        text=updated_text,
-                        parse_mode="HTML"
-                    )
-                    print(f"🎉 Прогноз на № {pred['target_dis'][0]} ЗАКРЫТ!")
-                except Exception as e:
-                    print(f"⚠️ Ошибка редактирования: {e}")
+            if not is_timeout:
+                update_diff_stats(pred["diff_2d"], is_win=has_hit)
 
-                if not is_timeout:
-                    update_diff_stats(pred["diff_2d"], is_win=has_hit)
-                preds_to_remove.append(pred)
+            preds_to_remove.append(pred)
 
-        for p in preds_to_remove:
-            if p in active_preds:
-                active_preds.remove(p)
+    for p in preds_to_remove:
+        if p in active_preds:
+            active_preds.remove(p)
 
 
-# ==================== ГЛАВНЫЙ ЦИКЛ ====================
+# ==================== ФОНОВЫЙ ПОТОК: ПРОГНОЗЫ ====================
+def prediction_worker():
+    """Отдельный поток для проверки прогнозов. Не мешает анонсам."""
+    print("🔮 Фоновый поток прогнозов запущен")
+    while True:
+        try:
+            with lock:
+                check_active_predictions()
+        except Exception as e:
+            print(f"⚠️ Prediction worker: {e}")
+        time.sleep(15)  # Проверяем прогнозы раз в 15 секунд
+
+
+# ==================== ГЛАВНЫЙ ЦИКЛ: АНОНСЫ ====================
 def api_cycle():
     global last_processed_gid
+
     raw_games = fetch_data()
     if not raw_games:
         return
 
     games = [g for g in raw_games if g.get("SI") == BACCARAT_SPORT_ID]
 
+    # Обновляем DI → GID
     for game in games:
         di = game.get("DI")
         gid = game.get("I")
         if di and gid:
             di_to_gid[int(di)] = int(gid)
 
-    check_active_predictions()
-
+    # ✅ АНОНСЫ — приоритет №1
     new_games = []
     for game in games:
         gid = game.get("I")
-        di = game.get("DI")
         if not gid or gid in sent_games:
             continue
-
         sent_games.add(gid)
         new_games.append(game)
 
@@ -464,6 +429,7 @@ def api_cycle():
 
     new_games.sort(key=lambda g: int(g.get("DI") or 0))
 
+    # Генерация прогнозов (быстро, без HTTP-запросов к статистике)
     for game in new_games:
         gid = game.get("I")
         di = game.get("DI")
@@ -479,35 +445,43 @@ def api_cycle():
 
             if prev_2d is not None and curr_2d is not None:
                 diff_2d = calculate_diff_2d(prev_2d, curr_2d, MODE)
-
                 if diff_2d is not None and 12 < diff_2d < 67:
                     if make_prediction(di_num, prev_2d, curr_2d, diff_2d):
-                        print(f"🔥 Прогноз на #N{di_num} [{MODE}] | 2D: {prev_2d} ➔ {curr_2d} | Δ2D = {diff_2d}")
+                        print(f"🔥 Прогноз #N{di_num} | Δ2D={diff_2d}")
 
         last_processed_gid = gid_num
 
+    # Мягкая очистка
     if len(sent_games) > 300:
         sent_games.clear()
     if len(di_to_gid) > 500:
-        di_to_gid.clear()
+        keys = list(di_to_gid.keys())[:200]
+        for k in keys:
+            del di_to_gid[k]
 
 
 def main():
-    print(f"🚀 ЗАПУСК БОТА | РЕЖИМ: {MODE}")
-    print(f"🧠 Аналитика: наблюдение за последними {game_history.maxlen} играми")
+    print(f"🚀 ЗАПУСК | РЕЖИМ: {MODE}")
+    print(f"📢 Анонсы: приоритет")
+    print(f"🔮 Прогнозы: фоновый поток")
 
     try:
         bot.remove_webhook()
-    except Exception as e:
-        print(f"⚠️ Сброс webhook: {e}")
+    except Exception:
+        pass
 
+    # ✅ Запускаем фоновый поток для прогнозов
+    pred_thread = threading.Thread(target=prediction_worker, daemon=True)
+    pred_thread.start()
+
+    # Основной цикл — только анонсы и генерация прогнозов
     while True:
         try:
             api_cycle()
-            time.sleep(10)
+            time.sleep(8)
         except Exception as e:
-            print(f"⚠️ Ошибка цикла: {e}")
-            time.sleep(20)
+            print(f"⚠️ Цикл: {e}")
+            time.sleep(15)
 
 
 if __name__ == "__main__":
