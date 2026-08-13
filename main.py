@@ -100,14 +100,26 @@ def fetch_game_cards_outcome(game_id):
         stat = data.get("statistic", {})
         main_stat = stat.get("main", {}) if isinstance(stat, dict) else {}
         
-        p1_raw = main_stat.get("P1") or stat.get("P1") or data.get("P1")
-        p2_raw = main_stat.get("P2") or stat.get("P2") or data.get("P2")
+        # ✅ ИСПРАВЛЕНО: В API Melbet карты лежат в ключах "P" (Player) и "B" (Banker)
+        p1_raw = main_stat.get("P") or stat.get("P") or data.get("P")
+        p2_raw = main_stat.get("B") or stat.get("B") or data.get("B")
         
         if p1_raw is None or p2_raw is None:
             return None
 
-        p1_count = len(json.loads(p1_raw)) if isinstance(p1_raw, str) and p1_raw.startswith("[") else (len(p1_raw) if isinstance(p1_raw, list) else p1_raw)
-        p2_count = len(json.loads(p2_raw)) if isinstance(p2_raw, str) and p2_raw.startswith("[") else (len(p2_raw) if isinstance(p2_raw, list) else p2_raw)
+        # ✅ ИСПРАВЛЕНО: Надежный парсинг JSON-массивов
+        try:
+            p1_list = json.loads(p1_raw) if isinstance(p1_raw, str) else p1_raw
+            p2_list = json.loads(p2_raw) if isinstance(p2_raw, str) else p2_raw
+            
+            p1_count = len(p1_list) if isinstance(p1_list, list) else int(p1_list)
+            p2_count = len(p2_list) if isinstance(p2_list, list) else int(p2_list)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
+
+        # Если игра еще не началась (пустые массивы карт)
+        if p1_count == 0 and p2_count == 0:
+            return None
 
         return f"{p1_count}/{p2_count}"
 
@@ -165,15 +177,19 @@ def send_to_channel(text):
 
 # ==================== ФУНКЦИИ ПРОГНОЗИРОВАНИЯ ====================
 def make_prediction(di_num, prev_2d, curr_2d, diff_2d):
-    """Отправляет сигнал в канал прогнозов"""
+    """Отправляет сигнал в канал прогнозов. 
+       Прогноз зависит от четности diff_2d."""
     if not PREDICTION_CHANNEL_ID:
         return False
 
+    # ✅ НОВАЯ ЛОГИКА: Четная разница -> 2/3, Нечетная -> 3/2
+    prediction_val = "2/3" if diff_2d % 2 == 0 else "3/2"
+    
     target_dis = [di_num, di_num + 1, di_num + 2]
     
     text = (
         f"🎰 <b>Игра № {di_num}</b>\n"
-        f"🃏 <b>Прогноз:</b> 3/2\n"
+        f"🃏 <b>Прогноз:</b> {prediction_val}\n"
         f"🔄 <b>Догонов:</b> 2\n"
         f"📌 <b>Результат:</b> ⏳ <i>В игре...</i>"
     )
@@ -187,6 +203,7 @@ def make_prediction(di_num, prev_2d, curr_2d, diff_2d):
                     "msg_id": sent.message_id,
                     "target_dis": target_dis,
                     "diff_2d": diff_2d,
+                    "prediction": prediction_val,  # Сохраняем прогноз для проверки
                     "results": {},
                     "created_at": time.time()
                 })
@@ -205,6 +222,7 @@ def check_active_predictions():
         preds_to_remove = []
         for pred in list(active_preds):
             target_dis = [int(x) for x in pred["target_dis"]]
+            prediction_val = pred.get("prediction", "3/2") # Берем сохраненный прогноз
             
             for target_di in target_dis:
                 if target_di not in pred["results"]:
@@ -218,18 +236,29 @@ def check_active_predictions():
                         print(f"🎯 Карта получена для игры № {target_di}: {outcome}")
                         pred["results"][target_di] = outcome
             
-            # Расчет и закрытие прогноза
-            has_hit = any(res == "3/2" for res in pred["results"].values())
+            # ✅ ИСПРАВЛЕНО: Проверка победы по сохраненному прогнозу
+            has_hit = any(res == prediction_val for res in pred["results"].values())
             all_finished = len(pred["results"]) >= len(target_dis)
+            
+            # ⏱ Таймаут: если прогноз висит больше 15 минут, принудительно закрываем как отмененный
+            is_timeout = (time.time() - pred.get("created_at", 0)) > 900
+            if is_timeout and not all_finished:
+                all_finished = True
+                has_hit = False
 
             if has_hit or all_finished:
-                status_symbol = "✅" if has_hit else "❌"
-                status_badge = "🟩 <b>ПРОХОД</b>" if has_hit else "🟥 <b>ПРОМАХ</b>"
-                res_str = ", ".join([f"{v}" for k, v in pred["results"].items()])
+                if is_timeout:
+                    status_symbol = "⚪"
+                    status_badge = "⚪ <b>ОТМЕНЕН</b>"
+                else:
+                    status_symbol = "✅" if has_hit else "❌"
+                    status_badge = "🟩 <b>ПРОХОД</b>" if has_hit else "🟥 <b>ПРОМАХ</b>"
+                    
+                res_str = ", ".join([f"{v}" for k, v in pred["results"].items()]) if pred["results"] else "Нет данных"
                 
                 updated_text = (
                     f"🎰 <b>Игра № {pred['target_dis'][0]}</b>\n"
-                    f"🃏 <b>Прогноз:</b> 3/2\n"
+                    f"🃏 <b>Прогноз:</b> {prediction_val}\n"
                     f"🔄 <b>Догонов:</b> 2\n"
                     f"📌 <b>Результат:</b> {res_str} {status_symbol}\n"
                     f"Итог: {status_badge}"
@@ -246,7 +275,8 @@ def check_active_predictions():
                 except Exception as e:
                     print(f"⚠️ Ошибка редактирования сообщения: {e}")
 
-                update_diff_stats(pred["diff_2d"], is_win=has_hit)
+                if not is_timeout:
+                    update_diff_stats(pred["diff_2d"], is_win=has_hit)
                 preds_to_remove.append(pred)
 
         for p in preds_to_remove:
