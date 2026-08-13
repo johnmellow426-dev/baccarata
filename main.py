@@ -75,17 +75,21 @@ def fetch_data():
 
 
 def fetch_game_cards_outcome(game_id):
-    """Запрашивает детальную статистику завершенной игры с полным логированием"""
+    """Запрашивает детальную статистику с обработкой 204 No Content"""
     url = STATISTIC_URL_TEMPLATE.format(game_id=game_id)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=7)
+        
+        # 204 No Content — игра еще идет или статистика формируется (просто ждем)
+        if resp.status_code == 204:
+            return None
+
         if resp.status_code != 200:
             print(f"⚠️ API вернул код {resp.status_code} для Game ID {game_id}")
             return None
 
         text = resp.text.strip()
         if not text:
-            print(f"⚠️ Пустой ответ от API для Game ID {game_id}")
             return None
 
         if text.startswith("<"):
@@ -96,15 +100,12 @@ def fetch_game_cards_outcome(game_id):
         stat = data.get("statistic", {})
         main_stat = stat.get("main", {}) if isinstance(stat, dict) else {}
         
-        # Поиск P1 и P2 в разных структурах JSON
         p1_raw = main_stat.get("P1") or stat.get("P1") or data.get("P1")
         p2_raw = main_stat.get("P2") or stat.get("P2") or data.get("P2")
         
         if p1_raw is None or p2_raw is None:
-            print(f"🔍 [Game ID {game_id}] Ключи карт P1/P2 еще не доступны в API.")
             return None
 
-        # Подсчет карт
         p1_count = len(json.loads(p1_raw)) if isinstance(p1_raw, str) and p1_raw.startswith("[") else (len(p1_raw) if isinstance(p1_raw, list) else p1_raw)
         p2_count = len(json.loads(p2_raw)) if isinstance(p2_raw, str) and p2_raw.startswith("[") else (len(p2_raw) if isinstance(p2_raw, list) else p2_raw)
 
@@ -113,7 +114,6 @@ def fetch_game_cards_outcome(game_id):
     except Exception as e:
         print(f"⚠️ Ошибка запроса карт (Game ID {game_id}): {e}")
     return None
-
 
 def update_diff_stats(diff_val, is_win):
     """Обновляет и выводит статистику побед по разнице Δ2D"""
