@@ -34,6 +34,7 @@ last_processed_gid = None
 
 active_preds = []   # Активные прогнозы
 diff_stats = {}     # Статистика: { diff_val: {"total": 0, "win": 0, "loss": 0} }
+di_to_gid = {}      # Реестр соответствия Display ID (DI) -> Game ID (GID)
 
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
@@ -57,7 +58,7 @@ def fetch_data():
 
 
 def fetch_game_cards_outcome(game_id):
-    """Запрашивает детальную статистику завершенной игры с расширенной обработкой типов"""
+    """Запрашивает детальную статистику завершенной игры"""
     url = STATISTIC_URL_TEMPLATE.format(game_id=game_id)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=7)
@@ -144,7 +145,6 @@ def make_prediction(di_num, prev_2d, curr_2d, diff_2d):
     if not PREDICTION_CHANNEL_ID:
         return False
 
-    # Целевые игры: текущая (#N) и +2 догона (#N+1, #N+2)
     target_dis = [di_num, di_num + 1, di_num + 2]
     
     text = (
@@ -172,58 +172,54 @@ def make_prediction(di_num, prev_2d, curr_2d, diff_2d):
     return False
 
 
-def check_and_finalize_predictions(game_di, game_gid):
-    """Проверяет завершенные игры и обновляет лаконичные сообщения"""
-    try:
-        game_di = int(game_di)
-    except (ValueError, TypeError):
-        return
-
-    outcome = fetch_game_cards_outcome(game_gid)
-    if not outcome:
-        return
-
-    print(f"🔎 Успешно получены карты для игры № {game_di} (ID: {game_gid}): {outcome}")
-
+def check_active_predictions():
+    """Периодически проверяет карты для всех нерасчитанных активных прогнозов"""
     with lock:
         preds_to_remove = []
         for pred in list(active_preds):
             target_dis = [int(x) for x in pred["target_dis"]]
             
-            if game_di in target_dis:
-                pred["results"][game_di] = outcome
+            # Запрашиваем результат для тех целевых игр, где результат еще не сохранен
+            for target_di in target_dis:
+                if target_di not in pred["results"]:
+                    game_gid = di_to_gid.get(target_di)
+                    if game_gid:
+                        outcome = fetch_game_cards_outcome(game_gid)
+                        if outcome:
+                            print(f"🔎 Получены карты для Игра № {target_di} (ID: {game_gid}): {outcome}")
+                            pred["results"][target_di] = outcome
+            
+            # Попадание если хотя бы в одной из сыгранных игр выпало 3/2
+            has_hit = any(res == "3/2" for res in pred["results"].values())
+            all_finished = len(pred["results"]) >= len(target_dis)
+
+            if has_hit or all_finished:
+                status_symbol = "✅" if has_hit else "❌"
+                status_badge = "🟩 <b>ПРОХОД</b>" if has_hit else "🟥 <b>ПРОМАХ</b>"
                 
-                # Попадание если хотя бы в одной из сыгранных игр выпало 3/2
-                has_hit = any(res == "3/2" for res in pred["results"].values())
-                all_finished = len(pred["results"]) >= len(target_dis)
+                res_str = ", ".join([f"{v}" for k, v in pred["results"].items()])
+                
+                updated_text = (
+                    f"🎰 <b>Игра № {pred['target_dis'][0]}</b>\n"
+                    f"🃏 <b>Прогноз:</b> 3/2\n"
+                    f"🔄 <b>Догонов:</b> 2\n"
+                    f"📌 <b>Результат:</b> {res_str} {status_symbol}\n"
+                    f"Итог: {status_badge}"
+                )
 
-                if has_hit or all_finished:
-                    status_symbol = "✅" if has_hit else "❌"
-                    status_badge = "🟩 <b>ПРОХОД</b>" if has_hit else "🟥 <b>ПРОМАХ</b>"
-                    
-                    res_str = ", ".join([f"{v}" for k, v in pred["results"].items()])
-                    
-                    updated_text = (
-                        f"🎰 <b>Игра № {pred['target_dis'][0]}</b>\n"
-                        f"🃏 <b>Прогноз:</b> 3/2\n"
-                        f"🔄 <b>Догонов:</b> 2\n"
-                        f"📌 <b>Результат:</b> {res_str} {status_symbol}\n"
-                        f"Итог: {status_badge}"
+                try:
+                    bot.edit_message_text(
+                        chat_id=pred["chat_id"],
+                        message_id=pred["msg_id"],
+                        text=updated_text,
+                        parse_mode="HTML"
                     )
+                    print(f"✅ Прогноз на № {pred['target_dis'][0]} успешно закрыт! (Результаты: {res_str})")
+                except Exception as e:
+                    print(f"⚠️ Ошибка редактирования сообщения: {e}")
 
-                    try:
-                        bot.edit_message_text(
-                            chat_id=pred["chat_id"],
-                            message_id=pred["msg_id"],
-                            text=updated_text,
-                            parse_mode="HTML"
-                        )
-                        print(f"✅ Прогноз на № {pred['target_dis'][0]} успешно обновлен!")
-                    except Exception as e:
-                        print(f"⚠️ Ошибка редактирования сообщения в Telegram: {e}")
-
-                    update_diff_stats(pred["diff_2d"], is_win=has_hit)
-                    preds_to_remove.append(pred)
+                update_diff_stats(pred["diff_2d"], is_win=has_hit)
+                preds_to_remove.append(pred)
 
         for p in preds_to_remove:
             if p in active_preds:
@@ -239,6 +235,16 @@ def api_cycle():
 
     games = [g for g in raw_games if g.get("SI") == BACCARAT_SPORT_ID]
 
+    # Обновляем связку Display ID -> Game ID для всех игр в линии
+    for game in games:
+        di = game.get("DI")
+        gid = game.get("I")
+        if di and gid:
+            di_to_gid[int(di)] = int(gid)
+
+    # Проверяем карточные исходы для активных прогнозов
+    check_active_predictions()
+
     new_games = []
     for game in games:
         gid = game.get("I")
@@ -249,14 +255,10 @@ def api_cycle():
         sent_games.add(gid)
         new_games.append(game)
 
-        # 1. Анонс будущей игры в CHANNEL_ID
+        # Анонс будущей игры в CHANNEL_ID
         text = format_game_info(game)
         if text:
             send_to_channel(text)
-
-        # 2. Проверка результатов
-        if di:
-            check_and_finalize_predictions(int(di), gid)
             
     new_games.sort(key=lambda g: int(g.get("DI") or 0))
 
@@ -284,20 +286,21 @@ def api_cycle():
 
         last_processed_gid = gid_num
 
+    # Очистка старых данных
     if len(sent_games) > 300: 
         sent_games.clear()
+    if len(di_to_gid) > 500:
+        di_to_gid.clear()
 
 
 def main():
-    print("🚀 ЗАПУСК БОТА (АНОНСЫ В CHANNEL_ID | ПРОГНОЗИ В PREDICTION_CHANNEL_ID)")
+    print("🚀 ЗАПУСК БОТА С АКТИВНЫМ МОНИТОРИНГОМ ИСХОДОВ")
     
-    # Сброс вебхуков для исключения Conflict 409
     try:
         bot.remove_webhook()
     except Exception as e:
         print(f"⚠️ Ошибка сброса webhook: {e}")
 
-    # Запускаем только цикл опроса API (без polling)
     while True:
         try:
             api_cycle()
